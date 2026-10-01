@@ -1,0 +1,180 @@
+/* Dokument-Scanner - einfache, fingerfreundliche Oberflaeche */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --blau: #14213d;
+  --akzent: #0e7c86;
+  --akzent-hell: #12a5b2;
+  --papier: #f4f5f7;
+  --karte: #ffffff;
+  --text: #1b1e24;
+  --rot: #b3261e;
+  --gelb-bg: #fff7e0;
+  --gelb-rand: #e0a800;
+}
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--papier);
+  color: var(--text);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+
+header {
+  background: var(--blau);
+  color: #fff;
+  padding: 18px 20px;
+  text-align: center;
+}
+header h1 { font-size: 1.5rem; font-weight: 700; }
+
+main {
+  flex: 1;
+  width: 100%;
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 20px 16px 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.karte {
+  background: var(--karte);
+  border-radius: 18px;
+  padding: 26px 22px;
+  box-shadow: 0 2px 10px rgba(20, 33, 61, 0.08);
+  text-align: center;
+}
+.karte h2 { font-size: 1.25rem; margin-bottom: 16px; }
+
+.verborgen { display: none !important; }
+
+/* Ladebalken */
+.balken-rahmen {
+  width: 100%;
+  height: 22px;
+  background: #e4e7ee;
+  border-radius: 11px;
+  overflow: hidden;
+  margin-bottom: 12px;
+}
+.balken {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--akzent), var(--akzent-hell));
+  border-radius: 11px;
+  transition: width 0.25s ease;
+}
+.status-text { font-size: 1.05rem; color: #444; margin-bottom: 10px; }
+.hinweis-klein { font-size: 0.9rem; color: #777; line-height: 1.5; }
+
+/* Buttons - gross und fingerfreundlich */
+button.gross {
+  display: block;
+  width: 100%;
+  padding: 20px 18px;
+  font-size: 1.25rem;
+  font-weight: 600;
+  border: none;
+  border-radius: 16px;
+  background: #e8eaf0;
+  color: var(--text);
+  cursor: pointer;
+  margin-top: 14px;
+  -webkit-tap-highlight-color: transparent;
+}
+button.gross:active { transform: scale(0.985); }
+button.gross.primaer {
+  background: var(--akzent);
+  color: #fff;
+}
+button.gross.primaer:active { background: var(--akzent-hell); }
+button:disabled { opacity: 0.5; }
+
+.anleitung { font-size: 1.1rem; line-height: 1.55; color: #333; }
+
+/* Spinner */
+.spinner {
+  width: 54px;
+  height: 54px;
+  border: 6px solid #e4e7ee;
+  border-top-color: var(--akzent);
+  border-radius: 50%;
+  margin: 4px auto 18px;
+  animation: drehen 0.9s linear infinite;
+}
+@keyframes drehen { to { transform: rotate(360deg); } }
+
+/* Ergebnis */
+.umschalter {
+  display: flex;
+  background: #e8eaf0;
+  border-radius: 14px;
+  padding: 4px;
+  margin-bottom: 14px;
+}
+.tab {
+  flex: 1;
+  padding: 14px 10px;
+  font-size: 1.1rem;
+  font-weight: 600;
+  border: none;
+  border-radius: 11px;
+  background: transparent;
+  color: #555;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.tab.aktiv { background: var(--blau); color: #fff; }
+
+.bild-rahmen {
+  background: #2b2f3a;
+  border-radius: 14px;
+  overflow: hidden;
+  min-height: 220px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.bild-rahmen img {
+  max-width: 100%;
+  max-height: 68vh;
+  display: block;
+}
+
+.knopf-reihe { margin-top: 6px; }
+
+/* Meldungen & Fehler */
+.meldungen {
+  background: var(--gelb-bg);
+  border: 1px solid var(--gelb-rand);
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin-bottom: 14px;
+  font-size: 1rem;
+  text-align: left;
+  line-height: 1.5;
+}
+.karte.fehler {
+  border: 2px solid var(--rot);
+}
+.karte.fehler h2 { color: var(--rot); }
+#fehler-text {
+  font-size: 1.05rem;
+  line-height: 1.55;
+  color: #333;
+  word-break: break-word;
+}
+
+footer {
+  text-align: center;
+  padding: 14px;
+  font-size: 0.85rem;
+  color: #888;
+}
