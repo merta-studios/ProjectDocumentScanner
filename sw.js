@@ -1,11 +1,11 @@
 /*
- * Service Worker: sorgt dafuer, dass die grossen Python/OpenCV-Dateien
+ * Ultra Scan - Service Worker: sorgt dafuer, dass die grossen Python/OpenCV-Dateien
  * (ca. 28 MB) nach dem ersten Besuch dauerhaft gespeichert sind und die
  * App danach blitzschnell (und sogar offline) startet.
  */
 "use strict";
 
-var CACHE_NAME = "dokument-scanner-v1";
+var CACHE_NAME = "ultra-scan-v2";
 
 self.addEventListener("install", function (e) {
   self.skipWaiting();
@@ -27,7 +27,7 @@ self.addEventListener("fetch", function (e) {
   var url = new URL(anfrage.url);
   if (url.origin !== self.location.origin) { return; }
 
-  if (url.pathname.indexOf("/vendor/") !== -1) {
+  if (url.pathname.indexOf("/vendor/") !== -1 || url.pathname.indexOf("/icons/") !== -1) {
     /* grosse, versionierte Dateien: Cache zuerst */
     e.respondWith(
       caches.open(CACHE_NAME).then(function (cache) {

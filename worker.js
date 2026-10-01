@@ -1,7 +1,11 @@
 /*
- * Web Worker: laedt Pyodide (Python als WebAssembly) + NumPy + OpenCV und
- * fuehrt die ORIGINAL-Pipeline (Datei "scanner" im Repo, unveraendert) ueber
- * die Wrapper-Datei scan_wrapper.py aus.
+ * Ultra Scan - Hintergrunddienst.
+ *
+ * Laedt Pyodide (Python als WebAssembly) + NumPy + OpenCV und fuehrt die
+ * ORIGINAL-Pipeline (Datei "scanner" im Repo, unveraendert) ueber die
+ * Wrapper-Datei scan_wrapper.py aus:
+ *   - "live": nur scanner.find_rough_quad() auf einem Mini-Frame
+ *   - "scan": kompletter Ultra Scan (Hybrid-Ergebnis)
  *
  * Alles liegt lokal unter vendor/pyodide-0.27.7/ - kein fremdes CDN.
  */
@@ -9,54 +13,43 @@
 
 var PYODIDE_PFAD = "vendor/pyodide-0.27.7/";
 
-/* Bekannte Dateigroessen (Bytes, unkomprimiert) fuer den ehrlichen
- * Ladebalken. Der Fortschritt wird aus den tatsaechlich empfangenen
- * Bytes berechnet. */
+/* Bekannte Dateigroessen (Bytes) fuer einen ehrlichen Ladebalken. */
 var LADE_DATEIEN = {
-  "pyodide.asm.js":    { groesse: 1255688,  text: "Python wird geladen \u2026" },
-  "pyodide.asm.wasm":  { groesse: 10105481, text: "Python wird geladen \u2026" },
-  "python_stdlib.zip": { groesse: 2360733,  text: "Python-Bibliothek wird geladen \u2026" },
-  "pyodide-lock.json": { groesse: 111490,   text: "Paketliste wird geladen \u2026" },
-  "numpy-2.0.2-cp312-cp312-pyodide_2024_0_wasm32.whl":
-                       { groesse: 3061694,  text: "NumPy wird geladen \u2026" },
-  "opencv_python-4.10.0.84-cp312-cp312-pyodide_2024_0_wasm32.whl":
-                       { groesse: 11435963, text: "OpenCV wird geladen \u2026" }
+  "pyodide.asm.js":    1255688,
+  "pyodide.asm.wasm":  10105481,
+  "python_stdlib.zip": 2360733,
+  "pyodide-lock.json": 111490,
+  "numpy-2.0.2-cp312-cp312-pyodide_2024_0_wasm32.whl": 3061694,
+  "opencv_python-4.10.0.84-cp312-cp312-pyodide_2024_0_wasm32.whl": 11435963
 };
 var GESAMT_BYTES = 0;
-Object.keys(LADE_DATEIEN).forEach(function (k) { GESAMT_BYTES += LADE_DATEIEN[k].groesse; });
+Object.keys(LADE_DATEIEN).forEach(function (k) { GESAMT_BYTES += LADE_DATEIEN[k]; });
 var geladenProDatei = {};
 
-function fortschrittMelden(text) {
+function fortschrittMelden() {
   var geladen = 0;
   Object.keys(geladenProDatei).forEach(function (k) { geladen += geladenProDatei[k]; });
-  var prozent = Math.min(99, Math.round(100 * geladen / GESAMT_BYTES));
-  postMessage({ typ: "fortschritt", prozent: prozent, text: text });
+  postMessage({ typ: "fortschritt", prozent: Math.min(99, Math.round(100 * geladen / GESAMT_BYTES)) });
 }
 
-/* fetch so umwickeln, dass empfangene Bytes gezaehlt werden */
+/* fetch umwickeln, damit empfangene Bytes gezaehlt werden */
 var originalFetch = self.fetch.bind(self);
 self.fetch = function (eingabe, optionen) {
   var url = (typeof eingabe === "string") ? eingabe : (eingabe && eingabe.url) || "";
   var dateiname = url.split("/").pop().split("?")[0];
-  var info = LADE_DATEIEN[dateiname];
+  var bekannt = LADE_DATEIEN[dateiname];
   return originalFetch(eingabe, optionen).then(function (antwort) {
-    if (!info || !antwort.ok || !antwort.body ||
-        typeof ReadableStream !== "function") { return antwort; }
+    if (!bekannt || !antwort.body || !antwort.ok) { return antwort; }
     geladenProDatei[dateiname] = 0;
-    fortschrittMelden(info.text);
     var leser = antwort.body.getReader();
     var strom = new ReadableStream({
-      start: function (controller) {
-        function pumpe() {
-          return leser.read().then(function (r) {
-            if (r.done) { controller.close(); return; }
-            geladenProDatei[dateiname] += r.value.byteLength;
-            fortschrittMelden(info.text);
-            controller.enqueue(r.value);
-            return pumpe();
-          });
-        }
-        return pumpe().catch(function (f) { controller.error(f); });
+      read: function (steuerung) {
+        return leser.read().then(function (stueck) {
+          if (stueck.done) { steuerung.close(); return; }
+          geladenProDatei[dateiname] += stueck.value.length;
+          fortschrittMelden();
+          steuerung.enqueue(stueck.value);
+        });
       },
       cancel: function (grund) { return leser.cancel(grund); }
     });
@@ -71,12 +64,11 @@ self.fetch = function (eingabe, optionen) {
 var pyodide = null;
 
 function initialisieren() {
-  postMessage({ typ: "fortschritt", prozent: 0, text: "Python wird geladen \u2026" });
+  postMessage({ typ: "fortschritt", prozent: 0 });
   try {
     importScripts(PYODIDE_PFAD + "pyodide.js");
   } catch (f) {
-    postMessage({ typ: "fehler", text: "Die Python-Laufzeit konnte nicht geladen werden. " +
-      "Bitte Internetverbindung pr\u00fcfen und die Seite neu laden.", detail: String(f) });
+    postMessage({ typ: "fehler", text: "Ultra Scan konnte nicht starten. Bitte die Seite neu laden.", detail: String(f) });
     return Promise.reject(f);
   }
   return loadPyodide({ indexURL: PYODIDE_PFAD })
@@ -85,7 +77,7 @@ function initialisieren() {
       return pyodide.loadPackage(["numpy", "opencv-python"]);
     })
     .then(function () {
-      postMessage({ typ: "fortschritt", prozent: 99, text: "Scan-Pipeline wird vorbereitet \u2026" });
+      postMessage({ typ: "fortschritt", prozent: 99 });
       /* Originaldatei "scanner" UNVERAENDERT laden und nur im virtuellen
        * Pyodide-Dateisystem unter dem importierbaren Namen scanner.py
        * ablegen. Die Datei im Repository bleibt byte-identisch. */
@@ -103,55 +95,73 @@ function initialisieren() {
     .then(function (quellen) {
       pyodide.FS.writeFile("/home/pyodide/scanner.py", new Uint8Array(quellen[0]));
       pyodide.FS.writeFile("/home/pyodide/scan_wrapper.py", new Uint8Array(quellen[1]));
-      pyodide.runPython("import scan_wrapper");   // Import-Test + Warmup
+      pyodide.runPython("import json, scan_wrapper");
       postMessage({ typ: "bereit" });
     })
     .catch(function (f) {
-      postMessage({ typ: "fehler", text: "Der Scanner konnte nicht gestartet werden. " +
-        "Bitte Internetverbindung pr\u00fcfen und die Seite neu laden.", detail: String(f) });
+      postMessage({ typ: "fehler", text: "Ultra Scan konnte nicht starten. Bitte die Seite neu laden.", detail: String(f) });
       throw f;
     });
 }
 
 var initPromise = initialisieren();
-initPromise.catch(function () { /* bereits an die Oberflaeche gemeldet */ });
+initPromise.catch(function () { /* bereits gemeldet */ });
 
-function scannen(nachricht) {
-  var rgba = new Uint8Array(nachricht.rgba);
+/* --------------------------- Live-Erkennung --------------------------- */
+function live(n) {
+  var rgba = new Uint8Array(n.rgba);
   pyodide.globals.set("rgba_js", rgba);
-  pyodide.globals.set("hoehe_js", nachricht.hoehe);
-  pyodide.globals.set("breite_js", nachricht.breite);
+  pyodide.globals.set("hoehe_js", n.hoehe);
+  pyodide.globals.set("breite_js", n.breite);
   var proxy = pyodide.runPython(
-    "import json\n" +
-    "import scan_wrapper\n" +
-    "_out, _h, _w, _info = scan_wrapper.scan_rgba(rgba_js.to_py(), hoehe_js, breite_js)\n" +
+    "import json, scan_wrapper\n" +
+    "json.dumps(scan_wrapper.quad_aus_rgba(rgba_js.to_py(), hoehe_js, breite_js))\n"
+  );
+  pyodide.globals.delete("rgba_js");
+  postMessage({ typ: "quad", quad: JSON.parse(proxy) });
+}
+
+/* ----------------------------- Vollscan ------------------------------- */
+function scannen(n) {
+  var rgba = new Uint8Array(n.rgba);
+  pyodide.globals.set("rgba_js", rgba);
+  pyodide.globals.set("hoehe_js", n.hoehe);
+  pyodide.globals.set("breite_js", n.breite);
+  var proxy = pyodide.runPython(
+    "import json, scan_wrapper\n" +
+    "_out, _h, _w, _info = scan_wrapper.scan_rgba_streng(rgba_js.to_py(), hoehe_js, breite_js)\n" +
     "(_out, _h, _w, json.dumps(_info))\n"
   );
   var ergebnis = proxy.toJs();
   proxy.destroy();
   pyodide.globals.delete("rgba_js");
-  var ausgabe = new Uint8Array(ergebnis[0]);          // Kopie aus dem WASM-Speicher
-  var kopie = new Uint8Array(ausgabe);                 // eigener ArrayBuffer
+  var info = JSON.parse(ergebnis[3]);
+  if (!info.dokument_erkannt || !ergebnis[0]) {
+    postMessage({ typ: "keindokument" });
+    return;
+  }
+  var kopie = new Uint8Array(new Uint8Array(ergebnis[0]));
   postMessage({
     typ: "ergebnis",
     rgba: kopie.buffer,
     hoehe: ergebnis[1],
     breite: ergebnis[2],
-    info: JSON.parse(ergebnis[3])
+    info: info
   }, [kopie.buffer]);
 }
 
-self.onmessage = function (ereignis) {
-  var n = ereignis.data;
-  if (n.typ === "scan") {
-    initPromise.then(function () {
-      try {
-        scannen(n);
-      } catch (f) {
-        postMessage({ typ: "fehler", scanFehler: true,
-          text: "Beim Scannen ist ein Fehler aufgetreten. Bitte mit einem anderen Foto erneut versuchen.",
-          detail: String(f) });
+self.onmessage = function (e) {
+  var n = e.data;
+  if (n.typ !== "scan" && n.typ !== "live") { return; }
+  initPromise.then(function () {
+    try {
+      if (n.typ === "live") { live(n); } else { scannen(n); }
+    } catch (f) {
+      if (n.typ === "live") {
+        postMessage({ typ: "quad", quad: null });
+      } else {
+        postMessage({ typ: "fehler", text: "Der Scan hat nicht geklappt. Bitte noch einmal versuchen.", detail: String(f) });
       }
-    }).catch(function () { /* Init-Fehler wurde bereits gemeldet */ });
-  }
+    }
+  }).catch(function () { /* Init-Fehler wurde bereits gemeldet */ });
 };
