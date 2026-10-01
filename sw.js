@@ -7,7 +7,7 @@
 
 /* Version bei jeder Änderung der Startlogik erhöhen: so wird kein alter,
  * möglicherweise unvollständiger Worker aus dem Browser-Cache verwendet. */
-var CACHE_NAME = "ultra-scan-v3";
+var CACHE_NAME = "ultra-scan-v4";
 
 self.addEventListener("install", function (e) {
   self.skipWaiting();
