@@ -115,7 +115,7 @@ worker.onmessage = function (e) {
   if (n.typ === "fortschritt") {
     letzterFortschritt = Date.now();
     ladeBalken.style.width = Math.max(2, n.prozent) + "%";
-    ladeText.textContent = "Wird geladen \u2026 " + Math.max(0, n.prozent) + " %";
+    ladeText.textContent = (n.phase || "Wird geladen") + " \u2026 " + Math.max(0, n.prozent) + " %";
   } else if (n.typ === "bereit") {
     workerBereit = true;
     ladeAbgeschlossen = true;
