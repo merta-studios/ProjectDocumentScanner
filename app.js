@@ -73,16 +73,53 @@ if ("serviceWorker" in navigator) {
 /* ========================== Worker ============================== */
 var worker = new Worker("worker.js");
 
+/* Verhindert, dass die App fuer immer bei "Wird geladen" haengen bleibt:
+ * jeder Fehler (und ein "er antwortet einfach nicht mehr"-Wachhund weiter
+ * unten) blendet das Lade-Overlay aus und zeigt stattdessen eine klare
+ * Meldung mit Neu-laden-Knopf. */
+var ladeAbgeschlossen = false; // true sobald "bereit" ODER ein Lade-Fehler kam
+
+function ladeFehlgeschlagen(text) {
+  if (ladeAbgeschlossen) { return; }
+  ladeAbgeschlossen = true;
+  clearInterval(wachhundTimer);
+  ladeOverlay.classList.add("verborgen");
+  zeigeMeldung("Start fehlgeschlagen",
+    text || "Ultra Scan konnte nicht geladen werden. Bitte die Seite neu laden.",
+    "!", /* neuLaden */ true);
+}
+
 worker.onerror = function (f) {
-  zeigeMeldung("Start fehlgeschlagen", "Bitte die Seite neu laden.", "!");
+  if (!workerBereit) {
+    ladeFehlgeschlagen("Ultra Scan konnte nicht gestartet werden. Bitte die Seite neu laden.");
+    return;
+  }
+  zeigeMeldung("Start fehlgeschlagen", "Bitte die Seite neu laden.", "!", true);
 };
+
+/* Wachhund: wenn 45s lang KEIN Fortschritt mehr ankommt (z.B. weil das
+ * Laden von Python/OpenCV im Hintergrund haengen bleibt, ohne dass ein
+ * Fehler gemeldet wird), zeigen wir einen Hinweis statt endlos zu warten. */
+var letzterFortschritt = Date.now();
+var wachhundTimer = setInterval(function () {
+  if (ladeAbgeschlossen) { return; }
+  if (Date.now() - letzterFortschritt > 45000) {
+    ladeFehlgeschlagen(
+      "Das Laden dauert ungew\u00f6hnlich lange \u2013 vermutlich ist die " +
+      "Internetverbindung unterbrochen. Bitte die Seite neu laden.");
+  }
+}, 3000);
 
 worker.onmessage = function (e) {
   var n = e.data;
   if (n.typ === "fortschritt") {
+    letzterFortschritt = Date.now();
     ladeBalken.style.width = Math.max(2, n.prozent) + "%";
+    ladeText.textContent = "Wird geladen \u2026 " + Math.max(0, n.prozent) + " %";
   } else if (n.typ === "bereit") {
     workerBereit = true;
+    ladeAbgeschlossen = true;
+    clearInterval(wachhundTimer);
     ladeBalken.style.width = "100%";
     setTimeout(function () {
       ladeOverlay.classList.add("verborgen");
@@ -98,6 +135,12 @@ worker.onmessage = function (e) {
     zeigeMeldung("Kein Dokument gefunden",
       "Auf diesem Bild ist kein Dokument zu erkennen. Versuche es mit einer Aufnahme, auf der das Blatt vollst\u00e4ndig und mit Abstand zum Untergrund zu sehen ist.", "!");
   } else if (n.typ === "fehler") {
+    if (!workerBereit) {
+      /* Fehler ist waehrend des Starts passiert (Pyodide/OpenCV-Ladephase):
+       * das Lade-Overlay muss weg, sonst bleibt die App bei "Wird geladen". */
+      ladeFehlgeschlagen(n.text);
+      return;
+    }
     liveOffen = false;
     scanFertig();
     zeigeMeldung("Das hat nicht geklappt", n.text || "Bitte noch einmal versuchen.", "!");
@@ -774,13 +817,18 @@ function herunterladen(datei) {
 }
 
 /* ========================= Meldungen ============================= */
-function zeigeMeldung(titel, text, symbol) {
+var meldungButton   = el("btn-meldung-ok");
+var meldungNeuLaden = false;
+function zeigeMeldung(titel, text, symbol, neuLaden) {
   meldungTitel.textContent = titel;
   meldungText.textContent = text;
   el("meldung-symbol").textContent = symbol || "!";
+  meldungNeuLaden = !!neuLaden;
+  meldungButton.textContent = meldungNeuLaden ? "Seite neu laden" : "Verstanden";
   meldungOv.classList.remove("verborgen");
 }
-el("btn-meldung-ok").addEventListener("click", function () {
+meldungButton.addEventListener("click", function () {
+  if (meldungNeuLaden) { window.location.reload(); return; }
   meldungOv.classList.add("verborgen");
 });
 

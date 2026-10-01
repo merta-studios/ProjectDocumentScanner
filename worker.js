@@ -32,7 +32,18 @@ function fortschrittMelden() {
   postMessage({ typ: "fortschritt", prozent: Math.min(99, Math.round(100 * geladen / GESAMT_BYTES)) });
 }
 
-/* fetch umwickeln, damit empfangene Bytes gezaehlt werden */
+/* fetch umwickeln, damit empfangene Bytes gezaehlt werden.
+ *
+ * WICHTIG: Wir geben IMMER die unveraenderte Original-Antwort zurueck und
+ * zaehlen die Bytes nur an einer GEKLONTEN Kopie im Hintergrund mit.
+ * Fruehere Version hat die Antwort als neu gebautes Response(stream, ...)
+ * zurueckgegeben - das bricht WebAssembly.instantiateStreaming() fuer
+ * pyodide.asm.wasm in Safari/iOS zuverlaessig (das MIME-/Streaming-Setup
+ * eines nachgebauten Response-Objekts wird dort nicht erkannt). Pyodide
+ * faengt diesen Fehler intern ab und haengt dann STUMM fuer immer in der
+ * WASM-Instanziierung - die App blieb dadurch ewig bei "Wird geladen"
+ * stehen, ganz ohne Fehlermeldung. Mit clone() bekommt instantiateStreaming
+ * die echte Netzwerk-Antwort, der Ladebalken funktioniert trotzdem. */
 var originalFetch = self.fetch.bind(self);
 self.fetch = function (eingabe, optionen) {
   var url = (typeof eingabe === "string") ? eingabe : (eingabe && eingabe.url) || "";
@@ -41,23 +52,19 @@ self.fetch = function (eingabe, optionen) {
   return originalFetch(eingabe, optionen).then(function (antwort) {
     if (!bekannt || !antwort.body || !antwort.ok) { return antwort; }
     geladenProDatei[dateiname] = 0;
-    var leser = antwort.body.getReader();
-    var strom = new ReadableStream({
-      read: function (steuerung) {
-        return leser.read().then(function (stueck) {
-          if (stueck.done) { steuerung.close(); return; }
+    try {
+      var klon = antwort.clone();
+      var leser = klon.body.getReader();
+      (function liesWeiter() {
+        leser.read().then(function (stueck) {
+          if (stueck.done) { return; }
           geladenProDatei[dateiname] += stueck.value.length;
           fortschrittMelden();
-          steuerung.enqueue(stueck.value);
-        });
-      },
-      cancel: function (grund) { return leser.cancel(grund); }
-    });
-    return new Response(strom, {
-      status: antwort.status,
-      statusText: antwort.statusText,
-      headers: antwort.headers
-    });
+          liesWeiter();
+        }).catch(function () { /* Fortschritt ist nur kosmetisch */ });
+      })();
+    } catch (f) { /* clone() fehlgeschlagen -> einfach ohne Fortschrittsanzeige weiter */ }
+    return antwort;
   });
 };
 
