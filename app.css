@@ -1,180 +1,555 @@
-/* Dokument-Scanner - einfache, fingerfreundliche Oberflaeche */
+/* ===========================================================
+   Ultra Scan - Liquid Glass Oberflaeche
+   =========================================================== */
+
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  --blau: #14213d;
-  --akzent: #0e7c86;
-  --akzent-hell: #12a5b2;
-  --papier: #f4f5f7;
-  --karte: #ffffff;
-  --text: #1b1e24;
-  --rot: #b3261e;
-  --gelb-bg: #fff7e0;
-  --gelb-rand: #e0a800;
+  --tiefe:        #05070f;
+  --tiefe-2:      #0a1020;
+  --glas:         rgba(255, 255, 255, 0.10);
+  --glas-stark:   rgba(255, 255, 255, 0.16);
+  --glas-rand:    rgba(255, 255, 255, 0.22);
+  --licht:        #eaf2ff;
+  --licht-weich:  rgba(234, 242, 255, 0.62);
+  --akzent:       #3aa0ff;
+  --akzent-2:     #19e8ff;
+  --akzent-glut:  rgba(58, 160, 255, 0.55);
+  --warn:         #ffb340;
+  --radius:       26px;
+  --topbar-h:     calc(58px + env(safe-area-inset-top));
 }
 
-html { -webkit-text-size-adjust: 100%; }
+html, body {
+  height: 100%;
+  overflow: hidden;
+  background: var(--tiefe);
+  color: var(--licht);
+  -webkit-text-size-adjust: 100%;
+  overscroll-behavior: none;
+}
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  background: var(--papier);
-  color: var(--text);
-  min-height: 100vh;
-  display: flex;
-  flex-direction: column;
-  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  letter-spacing: 0.1px;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
-header {
-  background: var(--blau);
-  color: #fff;
-  padding: 18px 20px;
-  text-align: center;
+body::before {           /* ruhiges Farbleuchten im Hintergrund */
+  content: "";
+  position: fixed;
+  inset: -20%;
+  background:
+    radial-gradient(45% 35% at 20% 12%, rgba(58, 160, 255, 0.26), transparent 70%),
+    radial-gradient(40% 40% at 85% 85%, rgba(25, 232, 255, 0.18), transparent 70%),
+    linear-gradient(160deg, #060a16, #05070f 60%);
+  filter: blur(10px);
+  z-index: -1;
+  animation: atmen 14s ease-in-out infinite alternate;
 }
-header h1 { font-size: 1.5rem; font-weight: 700; }
-
-main {
-  flex: 1;
-  width: 100%;
-  max-width: 720px;
-  margin: 0 auto;
-  padding: 20px 16px 32px;
-  display: flex;
-  flex-direction: column;
-  gap: 18px;
-}
-
-.karte {
-  background: var(--karte);
-  border-radius: 18px;
-  padding: 26px 22px;
-  box-shadow: 0 2px 10px rgba(20, 33, 61, 0.08);
-  text-align: center;
-}
-.karte h2 { font-size: 1.25rem; margin-bottom: 16px; }
+@keyframes atmen { to { transform: scale(1.08) translate3d(2%, -1%, 0); } }
 
 .verborgen { display: none !important; }
 
-/* Ladebalken */
-.balken-rahmen {
-  width: 100%;
-  height: 22px;
-  background: #e4e7ee;
-  border-radius: 11px;
-  overflow: hidden;
-  margin-bottom: 12px;
+/* ------------------------------- Glas ------------------------------- */
+.glas {
+  background: var(--glas);
+  -webkit-backdrop-filter: blur(26px) saturate(180%);
+  backdrop-filter: blur(26px) saturate(180%);
+  border: 1px solid var(--glas-rand);
+  box-shadow:
+    0 18px 50px rgba(0, 0, 0, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.30),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.06);
 }
-.balken {
-  height: 100%;
-  width: 0%;
-  background: linear-gradient(90deg, var(--akzent), var(--akzent-hell));
-  border-radius: 11px;
-  transition: width 0.25s ease;
-}
-.status-text { font-size: 1.05rem; color: #444; margin-bottom: 10px; }
-.hinweis-klein { font-size: 0.9rem; color: #777; line-height: 1.5; }
 
-/* Buttons - gross und fingerfreundlich */
-button.gross {
-  display: block;
-  width: 100%;
-  padding: 20px 18px;
-  font-size: 1.25rem;
-  font-weight: 600;
-  border: none;
-  border-radius: 16px;
-  background: #e8eaf0;
-  color: var(--text);
-  cursor: pointer;
-  margin-top: 14px;
-  -webkit-tap-highlight-color: transparent;
-}
-button.gross:active { transform: scale(0.985); }
-button.gross.primaer {
-  background: var(--akzent);
-  color: #fff;
-}
-button.gross.primaer:active { background: var(--akzent-hell); }
-button:disabled { opacity: 0.5; }
-
-.anleitung { font-size: 1.1rem; line-height: 1.55; color: #333; }
-
-/* Spinner */
-.spinner {
-  width: 54px;
-  height: 54px;
-  border: 6px solid #e4e7ee;
-  border-top-color: var(--akzent);
-  border-radius: 50%;
-  margin: 4px auto 18px;
-  animation: drehen 0.9s linear infinite;
-}
-@keyframes drehen { to { transform: rotate(360deg); } }
-
-/* Ergebnis */
-.umschalter {
-  display: flex;
-  background: #e8eaf0;
-  border-radius: 14px;
-  padding: 4px;
-  margin-bottom: 14px;
-}
-.tab {
-  flex: 1;
-  padding: 14px 10px;
-  font-size: 1.1rem;
-  font-weight: 600;
-  border: none;
-  border-radius: 11px;
-  background: transparent;
-  color: #555;
-  cursor: pointer;
-  -webkit-tap-highlight-color: transparent;
-}
-.tab.aktiv { background: var(--blau); color: #fff; }
-
-.bild-rahmen {
-  background: #2b2f3a;
-  border-radius: 14px;
-  overflow: hidden;
-  min-height: 220px;
+/* ------------------------------ Top-Bar ----------------------------- */
+.topbar {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 40;
+  height: var(--topbar-h);
+  padding: env(safe-area-inset-top) 18px 0 18px;
   display: flex;
   align-items: center;
-  justify-content: center;
+  gap: 12px;
+  border-width: 0 0 1px 0;
+  border-radius: 0;
+  background: rgba(8, 12, 24, 0.44);
 }
-.bild-rahmen img {
-  max-width: 100%;
-  max-height: 68vh;
-  display: block;
+.topbar .logo {
+  width: 34px; height: 34px;
+  border-radius: 10px;
+  box-shadow: 0 6px 18px rgba(58, 160, 255, 0.45);
 }
-
-.knopf-reihe { margin-top: 6px; }
-
-/* Meldungen & Fehler */
-.meldungen {
-  background: var(--gelb-bg);
-  border: 1px solid var(--gelb-rand);
-  border-radius: 12px;
-  padding: 12px 14px;
-  margin-bottom: 14px;
-  font-size: 1rem;
-  text-align: left;
-  line-height: 1.5;
+.wortmarke {
+  font-size: 19px;
+  font-weight: 650;
+  letter-spacing: 0.3px;
+  background: linear-gradient(100deg, #ffffff, #a9d8ff 60%, #19e8ff);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
 }
-.karte.fehler {
-  border: 2px solid var(--rot);
-}
-.karte.fehler h2 { color: var(--rot); }
-#fehler-text {
-  font-size: 1.05rem;
-  line-height: 1.55;
-  color: #333;
-  word-break: break-word;
+.topbar-status {
+  margin-left: auto;
+  font-size: 13px;
+  color: var(--licht-weich);
+  font-variant-numeric: tabular-nums;
 }
 
-footer {
+/* ------------------------------ Buehnen ----------------------------- */
+.buehne {
+  position: fixed;
+  top: var(--topbar-h);
+  left: 0; right: 0; bottom: 0;
+  overflow: hidden;
+  animation: einblenden 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+}
+@keyframes einblenden {
+  from { opacity: 0; transform: scale(0.985); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* ------------------------------- Kamera ----------------------------- */
+#video {
+  position: absolute;
+  inset: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+  background: #000;
+  transform-origin: center center;
+  transition: transform 0.12s ease-out;
+}
+#overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%; height: 100%;
+  pointer-events: none;
+}
+
+.kamera-hinweis {
+  position: absolute;
+  top: 18px; left: 50%;
+  transform: translateX(-50%);
+  padding: 10px 20px;
+  border-radius: 999px;
+  font-size: 15px;
+  font-weight: 560;
+  white-space: nowrap;
+  transition: opacity 0.3s ease, transform 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.kamera-hinweis.gut {
+  border-color: rgba(58, 160, 255, 0.65);
+  box-shadow: 0 0 34px var(--akzent-glut), inset 0 1px 0 rgba(255,255,255,.3);
+}
+
+.zoom-pille {
+  position: absolute;
+  top: 70px; left: 50%;
+  transform: translateX(-50%);
+  padding: 6px 14px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Ausloeser-Ring (Countdown) */
+.ausloeser-ring {
+  position: absolute;
+  left: 50%; top: 50%;
+  width: 124px; height: 124px;
+  margin: -62px 0 0 -62px;
+  opacity: 0;
+  transform: scale(0.8);
+  transition: opacity 0.25s ease, transform 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+  pointer-events: none;
+}
+.ausloeser-ring.aktiv { opacity: 1; transform: scale(1); }
+.ausloeser-ring svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+.ausloeser-ring circle {
+  fill: none;
+  stroke-width: 6;
+  stroke-linecap: round;
+}
+.ring-bg { stroke: rgba(255, 255, 255, 0.22); }
+.ring-fg {
+  stroke: url(#verlauf);
+  stroke: var(--akzent-2);
+  stroke-dasharray: 327;
+  stroke-dashoffset: 327;
+  filter: drop-shadow(0 0 10px var(--akzent-glut));
+  transition: stroke-dashoffset 0.12s linear;
+}
+
+/* Blitz beim Auslösen */
+.blitz {
+  position: fixed;
+  inset: 0;
+  background: #fff;
+  z-index: 60;
+  pointer-events: none;
+  animation: blitzen 0.42s ease-out forwards;
+}
+@keyframes blitzen {
+  0%   { opacity: 0.85; }
+  100% { opacity: 0; }
+}
+
+/* Kamera-Leiste unten */
+.kamera-leiste {
+  position: absolute;
+  left: 0; right: 0;
+  bottom: calc(18px + env(safe-area-inset-bottom));
+  padding: 0 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  z-index: 10;
+}
+.leiste-mitte { flex: 1; display: flex; justify-content: center; }
+.auto-pille {
+  padding: 9px 16px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 550;
+  color: var(--licht-weich);
+  background: rgba(10, 16, 32, 0.46);
+  -webkit-backdrop-filter: blur(20px) saturate(170%);
+  backdrop-filter: blur(20px) saturate(170%);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  transition: all 0.3s ease;
+}
+.auto-pille.scharf {
+  color: #fff;
+  border-color: rgba(25, 232, 255, 0.7);
+  box-shadow: 0 0 28px rgba(25, 232, 255, 0.35);
+}
+
+button.rund {
+  width: 62px; height: 62px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  color: var(--licht);
+  transition: transform 0.18s cubic-bezier(0.22, 1, 0.36, 1), box-shadow 0.25s ease;
+}
+button.rund:active { transform: scale(0.92); }
+button.rund svg { width: 27px; height: 27px; fill: currentColor; stroke: none; }
+button.rund svg .loch { fill: rgba(5, 7, 15, 0.55); }
+button.rund.dreht { animation: umdrehen 0.6s cubic-bezier(0.22, 1, 0.36, 1); }
+@keyframes umdrehen { to { transform: rotateY(360deg); } }
+
+.kamera-fehler {
+  position: absolute;
+  left: 50%; top: 50%;
+  transform: translate(-50%, -50%);
+  width: min(420px, calc(100% - 48px));
+  padding: 26px 24px;
+  border-radius: var(--radius);
   text-align: center;
-  padding: 14px;
-  font-size: 0.85rem;
-  color: #888;
+}
+.kamera-fehler h2 { font-size: 19px; margin-bottom: 8px; }
+.kamera-fehler p { color: var(--licht-weich); font-size: 15px; line-height: 1.5; }
+
+/* ------------------------------ Overlays ---------------------------- */
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(4, 6, 12, 0.58);
+  -webkit-backdrop-filter: blur(18px);
+  backdrop-filter: blur(18px);
+  animation: overlayAuf 0.3s ease;
+}
+@keyframes overlayAuf { from { opacity: 0; } to { opacity: 1; } }
+
+.karte {
+  width: min(460px, 100%);
+  border-radius: 32px;
+  padding: 34px 30px;
+  text-align: center;
+  animation: karteAuf 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+}
+@keyframes karteAuf {
+  from { opacity: 0; transform: translateY(22px) scale(0.96); }
+  to   { opacity: 1; transform: none; }
+}
+.karte h1 { font-size: 30px; font-weight: 700; letter-spacing: 0.4px; }
+.karte h2 { font-size: 21px; font-weight: 640; margin-bottom: 6px; }
+.unterzeile { color: var(--licht-weich); font-size: 15px; line-height: 1.55; margin-top: 8px; }
+
+.start-logo {
+  width: 96px; height: 96px;
+  border-radius: 26px;
+  margin-bottom: 18px;
+  box-shadow: 0 20px 60px rgba(58, 160, 255, 0.45);
+  animation: schweben 3.6s ease-in-out infinite alternate;
+}
+@keyframes schweben { to { transform: translateY(-8px) scale(1.02); } }
+
+.balken-rahmen {
+  margin-top: 20px;
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.13);
+  overflow: hidden;
+}
+.balken {
+  height: 100%; width: 2%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--akzent), var(--akzent-2));
+  box-shadow: 0 0 18px var(--akzent-glut);
+  transition: width 0.4s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* Arbeits-Animation */
+.scan-animation {
+  position: relative;
+  width: 118px; height: 150px;
+  margin: 0 auto 22px;
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(255,255,255,.16), rgba(255,255,255,.05));
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  overflow: hidden;
+}
+.scan-linie {
+  position: absolute;
+  left: 0; right: 0; height: 3px;
+  background: linear-gradient(90deg, transparent, var(--akzent-2), transparent);
+  box-shadow: 0 0 22px var(--akzent-2);
+  animation: scannen 1.7s cubic-bezier(0.65, 0, 0.35, 1) infinite;
+}
+@keyframes scannen {
+  0%   { top: 4%; }
+  50%  { top: 94%; }
+  100% { top: 4%; }
+}
+
+/* Sheets */
+.sheet-overlay { align-items: end; padding: 0; }
+.sheet {
+  width: min(520px, 100%);
+  margin: 0 auto calc(14px + env(safe-area-inset-bottom));
+  border-radius: 30px;
+  padding: 18px 16px 16px;
+  animation: sheetAuf 0.42s cubic-bezier(0.22, 1, 0.36, 1);
+}
+@keyframes sheetAuf { from { transform: translateY(60px); opacity: 0; } to { transform: none; opacity: 1; } }
+.sheet h2 { font-size: 15px; font-weight: 600; color: var(--licht-weich); margin: 2px 0 14px; text-align: center; }
+.sheet-knopf {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+  margin-bottom: 9px;
+  padding: 16px 18px;
+  font-size: 17px;
+  font-weight: 540;
+  color: var(--licht);
+  background: rgba(255, 255, 255, 0.09);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 18px;
+  cursor: pointer;
+  transition: transform 0.16s ease, background 0.2s ease;
+}
+.sheet-knopf:active { transform: scale(0.98); background: rgba(255, 255, 255, 0.16); }
+.sheet-knopf svg { width: 22px; height: 22px; fill: currentColor; opacity: 0.9; }
+.sheet-knopf.abbruch { justify-content: center; margin-top: 6px; margin-bottom: 0; color: var(--licht-weich); }
+
+/* Meldung */
+.meldung-symbol {
+  width: 62px; height: 62px;
+  margin: 0 auto 16px;
+  border-radius: 50%;
+  display: grid; place-items: center;
+  font-size: 30px; font-weight: 700;
+  color: #06101c;
+  background: linear-gradient(140deg, var(--warn), #ffd98a);
+  box-shadow: 0 12px 34px rgba(255, 179, 64, 0.4);
+  animation: pochen 2.4s ease-in-out infinite;
+}
+@keyframes pochen { 50% { transform: scale(1.06); } }
+
+/* Pillen-Buttons */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  padding: 14px 22px;
+  font-size: 16px;
+  font-weight: 580;
+  color: var(--licht);
+  background: rgba(255, 255, 255, 0.10);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: transform 0.16s ease, box-shadow 0.25s ease, background 0.2s ease;
+}
+.pill:active { transform: scale(0.96); }
+.pill svg { width: 19px; height: 19px; fill: currentColor; stroke: currentColor; stroke-width: 0; }
+.pill svg path[stroke-width] { fill: none; stroke-linecap: round; }
+.pill.primaer {
+  background: linear-gradient(120deg, var(--akzent), var(--akzent-2));
+  color: #04121f;
+  border-color: transparent;
+  box-shadow: 0 12px 34px rgba(58, 160, 255, 0.42);
+}
+.pill.breit { width: 100%; margin-top: 20px; }
+
+/* ------------------------------ Galerie ----------------------------- */
+.galerie-rollbereich {
+  position: absolute;
+  inset: 0 0 calc(94px + env(safe-area-inset-bottom)) 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 18px 16px 24px;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 18px;
+  align-content: start;
+  justify-items: center;
+}
+.scan-karte {
+  position: relative;
+  width: min(620px, 100%);
+  border-radius: 24px;
+  padding: 12px;
+  background: var(--glas);
+  -webkit-backdrop-filter: blur(22px) saturate(170%);
+  backdrop-filter: blur(22px) saturate(170%);
+  border: 1px solid var(--glas-rand);
+  box-shadow: 0 16px 44px rgba(0, 0, 0, 0.42), inset 0 1px 0 rgba(255,255,255,.25);
+  animation: karteAuf 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.scan-karte.geht {
+  animation: karteWeg 0.32s ease forwards;
+}
+@keyframes karteWeg {
+  to { opacity: 0; transform: scale(0.9) translateY(10px); }
+}
+.scan-bild-rahmen {
+  border-radius: 16px;
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.35);
+  display: grid;
+  place-items: center;
+  min-height: 160px;
+}
+.scan-bild-rahmen img {
+  display: block;
+  max-width: 100%;
+  max-height: 58vh;
+  transition: transform 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.scan-kopf {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 2px 6px 10px;
+  font-size: 14px;
+  color: var(--licht-weich);
+}
+.scan-werkzeuge { margin-left: auto; display: flex; gap: 8px; }
+.werkzeug {
+  width: 40px; height: 40px;
+  border-radius: 13px;
+  display: grid; place-items: center;
+  color: var(--licht);
+  background: rgba(255, 255, 255, 0.10);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  cursor: pointer;
+  transition: transform 0.16s ease, background 0.2s ease;
+}
+.werkzeug:active { transform: scale(0.9); }
+.werkzeug svg { width: 19px; height: 19px; fill: currentColor; }
+.werkzeug.loeschen:active { background: rgba(255, 90, 90, 0.3); }
+
+.galerie-leiste {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  padding: 14px 18px calc(14px + env(safe-area-inset-bottom));
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  border-radius: 0;
+  border-width: 1px 0 0 0;
+  background: rgba(8, 12, 24, 0.5);
+}
+.galerie-leiste .pill { flex: 1; max-width: 280px; }
+
+/* ------------------------------- Toast ------------------------------ */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: calc(110px + env(safe-area-inset-bottom));
+  transform: translateX(-50%) translateY(14px);
+  z-index: 70;
+  padding: 12px 20px;
+  border-radius: 999px;
+  font-size: 15px;
+  background: rgba(10, 16, 32, 0.72);
+  -webkit-backdrop-filter: blur(22px) saturate(180%);
+  backdrop-filter: blur(22px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45);
+  opacity: 0;
+  transition: opacity 0.3s ease, transform 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.toast.sichtbar { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* ============================== Tablet ============================== */
+@media (min-width: 700px) {
+  :root { --topbar-h: calc(66px + env(safe-area-inset-top)); }
+  .topbar { padding-left: 28px; padding-right: 28px; gap: 14px; }
+  .topbar .logo { width: 40px; height: 40px; border-radius: 12px; }
+  .wortmarke { font-size: 22px; }
+
+  .kamera-leiste { padding: 0 42px; bottom: calc(30px + env(safe-area-inset-bottom)); }
+  button.rund { width: 72px; height: 72px; }
+  button.rund svg { width: 31px; height: 31px; }
+  .auto-pille { font-size: 15px; padding: 11px 22px; }
+  .kamera-hinweis { font-size: 17px; padding: 12px 26px; top: 26px; }
+
+  /* iPad: Scans nebeneinander statt endlos untereinander */
+  .galerie-rollbereich {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 22px;
+    padding: 24px 28px 28px;
+    align-items: start;
+  }
+  .scan-karte { width: 100%; }
+  .scan-bild-rahmen img { max-height: 46vh; }
+  .galerie-leiste { padding: 18px 28px calc(18px + env(safe-area-inset-bottom)); }
+  .galerie-leiste .pill { max-width: 320px; font-size: 17px; padding: 16px 26px; }
+}
+
+/* iPad Querformat: drei Spalten, Kamera-Steuerung weiter aussen */
+@media (min-width: 1000px) {
+  .galerie-rollbereich { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .scan-bild-rahmen img { max-height: 52vh; }
+  .karte { width: min(520px, 100%); }
+}
+
+/* niedrige Hoehe (iPhone/iPad quer) */
+@media (max-height: 520px) {
+  .karte { padding: 22px 24px; }
+  .start-logo { width: 64px; height: 64px; margin-bottom: 10px; }
+  .karte h1 { font-size: 24px; }
+  .scan-animation { width: 86px; height: 108px; margin-bottom: 14px; }
+  .scan-bild-rahmen img { max-height: 62vh; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 0.01ms !important; transition-duration: 0.08s !important; }
 }

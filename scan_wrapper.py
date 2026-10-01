@@ -105,3 +105,47 @@ def scan_rgba(rgba_flat, hoehe, breite):
     out = cv2.cvtColor(hybrid, cv2.COLOR_BGR2RGBA)
     h, w = out.shape[:2]
     return out.tobytes(), h, w, info
+
+
+# ---------------------------------------------------------------------------
+# Zusaetze fuer die Web-App "Ultra Scan"
+# ---------------------------------------------------------------------------
+# Auch hier gilt: die Original-Pipeline bleibt unberuehrt. Die folgenden
+# Funktionen rufen ausschliesslich scanner.find_rough_quad() bzw. scan_bgr()
+# auf und formatieren die Ergebnisse fuer die Oberflaeche.
+
+def quad_aus_rgba(rgba_flat, hoehe, breite):
+    """Live-Erkennung fuer den Kamera-Sucher.
+
+    Nutzt AUSSCHLIESSLICH scanner.find_rough_quad() auf einem (bereits vom
+    Browser verkleinerten) Frame. Rueckgabe: Liste von 4 [x, y]-Paaren in
+    der Reihenfolge oben-links, oben-rechts, unten-rechts, unten-links -
+    oder None, wenn kein Viereck gefunden wurde.
+    """
+    arr = np.frombuffer(bytes(rgba_flat), dtype=np.uint8)
+    arr = arr.reshape((int(hoehe), int(breite), 4))
+    bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+    quad = scanner.find_rough_quad(bgr)
+    if quad is None:
+        return None
+    pts = scanner.order_pts(quad)
+    return [[float(p[0]), float(p[1])] for p in pts]
+
+
+def scan_rgba_streng(rgba_flat, hoehe, breite):
+    """Wie scan_rgba(), bricht aber ab, wenn kein Dokument erkannt wurde.
+
+    Rueckgabe: (rgba_bytes | None, hoehe, breite, info_dict).
+    Bei info_dict["dokument_erkannt"] == False wird NICHTS verarbeitet -
+    die Oberflaeche zeigt dann eine Meldung statt eines Scans vom ganzen
+    Bild.
+    """
+    arr = np.frombuffer(bytes(rgba_flat), dtype=np.uint8)
+    arr = arr.reshape((int(hoehe), int(breite), 4))
+    bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+    if scanner.find_rough_quad(bgr) is None:
+        return None, 0, 0, {"dokument_erkannt": False, "meldungen": []}
+    hybrid, info = scan_bgr(bgr)
+    out = cv2.cvtColor(hybrid, cv2.COLOR_BGR2RGBA)
+    h, w = out.shape[:2]
+    return out.tobytes(), h, w, info

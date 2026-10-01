@@ -2,80 +2,148 @@
 <html lang="de">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Dokument-Scanner</title>
-  <meta name="description" content="Dokumente direkt im Browser scannen - ohne Server, ohne Cloud.">
-  <meta name="theme-color" content="#14213d">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <title>Ultra Scan</title>
+  <meta name="description" content="Ultra Scan - Dokumente in Studioqualit&auml;t, direkt auf deinem Ger&auml;t.">
+  <meta name="theme-color" content="#05070f">
   <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="favicon.png" sizes="32x32" type="image/png">
+  <link rel="icon" href="icons/icon-192.png" sizes="192x192" type="image/png">
   <link rel="apple-touch-icon" href="icons/icon-180.png">
   <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="apple-mobile-web-app-title" content="Scanner">
+  <meta name="apple-mobile-web-app-title" content="Ultra Scan">
   <link rel="stylesheet" href="app.css">
 </head>
 <body>
-  <header>
-    <h1>📄 Dokument-Scanner</h1>
+
+  <!-- ============================ Top-Bar ============================ -->
+  <header class="topbar glas" id="topbar">
+    <img src="icons/icon-192.png" alt="" class="logo" width="34" height="34">
+    <span class="wortmarke">Ultra&nbsp;Scan</span>
+    <span class="topbar-status" id="topbar-status"></span>
   </header>
 
-  <main>
-    <!-- Lade-Karte (erster Start) -->
-    <section id="lade-karte" class="karte">
-      <h2 id="lade-titel">Scanner wird vorbereitet &hellip;</h2>
-      <div class="balken-rahmen" role="progressbar" aria-valuemin="0" aria-valuemax="100">
-        <div id="lade-balken" class="balken"></div>
+  <!-- ============================ Kamera ============================= -->
+  <section class="buehne" id="kamera-screen">
+    <video id="video" playsinline autoplay muted></video>
+    <canvas id="overlay"></canvas>
+
+    <div class="kamera-hinweis glas" id="kamera-hinweis">Dokument anvisieren</div>
+
+    <div class="ausloeser-ring" id="ausloeser-ring" aria-hidden="true">
+      <svg viewBox="0 0 120 120">
+        <circle class="ring-bg" cx="60" cy="60" r="52"></circle>
+        <circle class="ring-fg" id="ring-fg" cx="60" cy="60" r="52"></circle>
+      </svg>
+    </div>
+
+    <div class="kamera-leiste">
+      <button class="rund glas" id="btn-quelle" aria-label="Bild ausw&auml;hlen">
+        <svg viewBox="0 0 24 24"><path d="M4 7h3l1.6-2.2A2 2 0 0 1 10.2 4h3.6a2 2 0 0 1 1.6.8L17 7h3a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2Z"/><circle cx="12" cy="13" r="3.4" class="loch"/></svg>
+      </button>
+      <div class="leiste-mitte" id="leiste-mitte">
+        <span class="auto-pille" id="auto-pille">Automatischer Ausl&ouml;ser</span>
       </div>
-      <p id="lade-status" class="status-text">Starte &hellip;</p>
-      <p class="hinweis-klein">
-        Beim allerersten Start werden einmalig ca. 28&nbsp;MB geladen
-        (Python&nbsp;+&nbsp;OpenCV laufen direkt auf diesem Ger&auml;t).
-        Danach ist alles gespeichert und es geht viel schneller.
-      </p>
-    </section>
+      <button class="rund glas" id="btn-wechseln" aria-label="Kamera umdrehen">
+        <svg viewBox="0 0 24 24"><path d="M12 5a7 7 0 0 1 6.7 5h-2.2l3.2 4 3.2-4h-2.1A9 9 0 0 0 3.3 11l1.9.4A7 7 0 0 1 12 5Zm0 14a7 7 0 0 1-6.7-5h2.2L4.3 10 1.1 14h2.1A9 9 0 0 0 20.7 13l-1.9-.4A7 7 0 0 1 12 19Z"/></svg>
+      </button>
+    </div>
 
-    <!-- Fehler-Banner -->
-    <section id="fehler-karte" class="karte fehler verborgen">
-      <h2>⚠️ Es ist ein Problem aufgetreten</h2>
-      <p id="fehler-text"></p>
-      <button id="btn-neuladen" class="gross">Seite neu laden</button>
-    </section>
+    <div class="zoom-pille glas verborgen" id="zoom-pille">1,0&times;</div>
+    <div class="kamera-fehler glas verborgen" id="kamera-fehler">
+      <h2>Kamera nicht verf&uuml;gbar</h2>
+      <p id="kamera-fehler-text">Erlaube den Kamerazugriff &ndash; oder w&auml;hle unten ein Bild aus.</p>
+    </div>
+  </section>
 
-    <!-- Start-Karte -->
-    <section id="start-karte" class="karte verborgen">
-      <p class="anleitung">Fotografiere ein Dokument oder w&auml;hle ein Foto aus deiner Mediathek.</p>
-      <button id="btn-foto" class="gross primaer">📷&nbsp; Foto aufnehmen / ausw&auml;hlen</button>
-      <input type="file" id="datei-input" accept="image/*" hidden>
-    </section>
+  <!-- ============================ Galerie ============================ -->
+  <section class="buehne verborgen" id="galerie-screen">
+    <div class="galerie-rollbereich" id="galerie-liste"></div>
+    <div class="galerie-leiste glas">
+      <button class="pill" id="btn-weiter-scannen">
+        <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke-width="2.4"/></svg>
+        Weiterer Scan
+      </button>
+      <button class="pill primaer" id="btn-teilen">
+        <svg viewBox="0 0 24 24"><path d="M12 3l4 4h-3v9h-2V7H8l4-4Zm-7 9v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7h-2v7H7v-7H5Z"/></svg>
+        Teilen
+      </button>
+    </div>
+  </section>
 
-    <!-- Verarbeitungs-Karte -->
-    <section id="arbeit-karte" class="karte verborgen">
-      <div class="spinner"></div>
-      <h2>Dokument wird gescannt &hellip;</h2>
-      <p class="status-text" id="arbeit-status">Die komplette Scan-Pipeline l&auml;uft jetzt auf deinem Ger&auml;t.
-        Das kann 10&ndash;60 Sekunden dauern &ndash; bitte warten.</p>
-    </section>
+  <!-- ====================== Lade-Overlay (Start) ===================== -->
+  <div class="overlay" id="lade-overlay">
+    <div class="glas karte start-karte">
+      <img src="icons/icon-256.png" alt="" class="start-logo" width="96" height="96">
+      <h1>Ultra&nbsp;Scan</h1>
+      <p class="unterzeile" id="lade-text">Wird geladen &hellip;</p>
+      <div class="balken-rahmen"><div class="balken" id="lade-balken"></div></div>
+    </div>
+  </div>
 
-    <!-- Ergebnis -->
-    <section id="ergebnis-karte" class="karte verborgen">
-      <div id="meldungen" class="meldungen verborgen"></div>
-      <div class="umschalter">
-        <button id="btn-scan-ansicht" class="tab aktiv">Scan</button>
-        <button id="btn-original-ansicht" class="tab">Original</button>
-      </div>
-      <div class="bild-rahmen">
-        <img id="ergebnis-bild" alt="Gescanntes Dokument">
-      </div>
-      <div class="knopf-reihe">
-        <button id="btn-speichern" class="gross primaer">💾&nbsp; Scan sichern / teilen</button>
-        <button id="btn-neu" class="gross">🔄&nbsp; Neues Foto</button>
-      </div>
-    </section>
-  </main>
+  <!-- ====================== Arbeits-Overlay ========================== -->
+  <div class="overlay verborgen" id="arbeit-overlay">
+    <div class="glas karte arbeit-karte">
+      <div class="scan-animation"><div class="scan-linie"></div></div>
+      <h2>Ultra&nbsp;Scan l&auml;uft</h2>
+      <p class="unterzeile">Einen Moment &ndash; es wird perfekt.</p>
+    </div>
+  </div>
 
-  <footer>
-    <p>L&auml;uft komplett auf deinem Ger&auml;t &ndash; kein Bild verl&auml;sst das iPad.</p>
-  </footer>
+  <!-- ====================== Auswahl-Sheet ============================ -->
+  <div class="overlay sheet-overlay verborgen" id="quelle-sheet">
+    <div class="glas sheet">
+      <h2>Bild hinzuf&uuml;gen</h2>
+      <button class="sheet-knopf" id="btn-zwischenablage">
+        <svg viewBox="0 0 24 24"><path d="M9 3h6a1 1 0 0 1 1 1v1h2a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2V4a1 1 0 0 1 1-1Z"/></svg>
+        Zwischenablage benutzen
+      </button>
+      <button class="sheet-knopf" id="btn-foto">
+        <svg viewBox="0 0 24 24"><path d="M4 5h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Zm2 11h12l-4-5-3 3.5L9 13l-3 3Z"/></svg>
+        Foto ausw&auml;hlen
+      </button>
+      <button class="sheet-knopf" id="btn-datei">
+        <svg viewBox="0 0 24 24"><path d="M6 2h7l5 5v15a0 0 0 0 1 0 0H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2Zm7 1.5V8h4.5L13 3.5Z"/></svg>
+        Datei ausw&auml;hlen
+      </button>
+      <button class="sheet-knopf abbruch" id="btn-sheet-schliessen">Abbrechen</button>
+    </div>
+  </div>
 
+  <!-- ====================== Teilen-Sheet ============================= -->
+  <div class="overlay sheet-overlay verborgen" id="teilen-sheet">
+    <div class="glas sheet">
+      <h2>Teilen</h2>
+      <button class="sheet-knopf" id="btn-teilen-bild">
+        <svg viewBox="0 0 24 24"><path d="M4 5h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Zm2 11h12l-4-5-3 3.5L9 13l-3 3Z"/></svg>
+        Als Bild teilen
+      </button>
+      <button class="sheet-knopf" id="btn-teilen-pdf">
+        <svg viewBox="0 0 24 24"><path d="M6 2h7l5 5v15H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2Zm7 1.5V8h4.5L13 3.5Z"/></svg>
+        Als PDF teilen
+      </button>
+      <button class="sheet-knopf abbruch" id="btn-teilen-schliessen">Abbrechen</button>
+    </div>
+  </div>
+
+  <!-- ====================== Meldung / Fehler ========================= -->
+  <div class="overlay verborgen" id="meldung-overlay">
+    <div class="glas karte meldung-karte">
+      <div class="meldung-symbol" id="meldung-symbol">!</div>
+      <h2 id="meldung-titel">Kein Dokument gefunden</h2>
+      <p class="unterzeile" id="meldung-text">Auf diesem Bild ist kein Dokument zu erkennen.</p>
+      <button class="pill primaer breit" id="btn-meldung-ok">Verstanden</button>
+    </div>
+  </div>
+
+  <div class="toast verborgen" id="toast"></div>
+
+  <input type="file" id="datei-input-foto" accept="image/*" hidden>
+  <input type="file" id="datei-input-datei" accept="image/*" hidden>
+
+  <script src="pdf.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
