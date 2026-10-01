@@ -22,7 +22,7 @@
   <header class="topbar glas" id="topbar">
     <img src="icons/icon-192.png" alt="" class="logo" width="34" height="34">
     <span class="wortmarke">Ultra&nbsp;Scan</span>
-    <span class="topbar-status" id="topbar-status"></span>
+    <button class="topbar-status verborgen" id="topbar-status" type="button" aria-label="Zu den fertigen Scans"></button>
   </header>
 
   <!-- ============================ Kamera ============================= -->
@@ -78,8 +78,9 @@
     <div class="glas karte start-karte">
       <img src="icons/icon-256.png" alt="" class="start-logo" width="96" height="96">
       <h1>Ultra&nbsp;Scan</h1>
-      <p class="unterzeile" id="lade-text">Wird geladen &hellip;</p>
-      <div class="balken-rahmen"><div class="balken" id="lade-balken"></div></div>
+      <p class="unterzeile" id="lade-text">Wird geladen&hellip;</p>
+      <div class="lade-prozent" id="lade-prozent">0&nbsp;%</div>
+      <div class="balken-rahmen" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="balken" id="lade-balken"></div></div>
     </div>
   </div>
 

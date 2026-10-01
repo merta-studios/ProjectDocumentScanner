@@ -27,6 +27,7 @@ var galerieListe = el("galerie-liste");
 var ladeOverlay  = el("lade-overlay");
 var ladeBalken   = el("lade-balken");
 var ladeText     = el("lade-text");
+var ladeProzent  = el("lade-prozent");
 var arbeitOverlay= el("arbeit-overlay");
 var meldungOv    = el("meldung-overlay");
 var meldungTitel = el("meldung-titel");
@@ -73,6 +74,216 @@ if ("serviceWorker" in navigator) {
 /* ========================== Worker ============================== */
 var worker = new Worker("worker.js");
 
+/* -------------------- Realistische Lade-Anzeige --------------------
+ * Der Worker meldet nur grobe echte Meilensteine. Die Anzeige bewegt den
+ * Balken deshalb selbst in unregelmaessigen, aber begrenzten Schritten und
+ * springt erst bei echten Hintergrund-Meilensteinen in die naechste Zone. */
+var ladeZustand = {
+  wert: 0,
+  phase: "phase1",
+  raf: 0,
+  timer: 0,
+  token: 0,
+  opencvGemeldet: false,
+  pipelineGemeldet: false,
+  pipelineZu95Gestartet: false,
+  pipelineBei95: false,
+  pipeline95Zeit: 0,
+  bereitGemeldet: false,
+  bereitCallback: null,
+  zu100Gestartet: false
+};
+
+function ladeZufall(min, max) { return min + Math.random() * (max - min); }
+function ladeClamp(n, min, max) { return Math.min(max, Math.max(min, n)); }
+function ladeEaseOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
+function ladeEaseInOut(t) {
+  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+}
+
+function ladeSetzen(wert) {
+  var w = ladeClamp(wert, 0, 100);
+  ladeZustand.wert = w;
+  ladeBalken.style.width = w.toFixed(3) + "%";
+  ladeText.textContent = "Wird geladen\u2026";
+  if (ladeProzent) { ladeProzent.textContent = Math.round(w) + " %"; }
+  if (ladeBalken.parentElement) {
+    ladeBalken.parentElement.setAttribute("aria-valuenow", String(Math.round(w)));
+  }
+}
+
+function ladeBewegungStoppen() {
+  if (ladeZustand.raf) { cancelAnimationFrame(ladeZustand.raf); ladeZustand.raf = 0; }
+  if (ladeZustand.timer) { clearTimeout(ladeZustand.timer); ladeZustand.timer = 0; }
+  ladeZustand.token++;
+}
+
+function ladeAnimationStoppen() { ladeBewegungStoppen(); }
+
+function ladeGleiteZu(ziel, dauer, easing, danach) {
+  ladeBewegungStoppen();
+  ziel = ladeClamp(Math.max(ziel, ladeZustand.wert), 0, 100);
+  var start = ladeZustand.wert;
+  var distanz = ziel - start;
+  var token = ladeZustand.token;
+  var startZeit = performance.now();
+  var reduzierteBewegung = false;
+  try { reduzierteBewegung = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches; } catch (f) {}
+  var laenge = reduzierteBewegung ? Math.min(90, dauer) : Math.max(1, dauer);
+  if (distanz < 0.02) {
+    ladeSetzen(ziel);
+    if (danach) { ladeZustand.timer = setTimeout(danach, 0); }
+    return;
+  }
+  function schritt(jetzt) {
+    if (token !== ladeZustand.token) { return; }
+    var t = ladeClamp((jetzt - startZeit) / laenge, 0, 1);
+    var e = (easing || ladeEaseOutCubic)(t);
+    ladeSetzen(start + distanz * e);
+    if (t < 1) {
+      ladeZustand.raf = requestAnimationFrame(schritt);
+    } else {
+      ladeZustand.raf = 0;
+      ladeSetzen(ziel);
+      if (danach) { danach(); }
+    }
+  }
+  ladeZustand.raf = requestAnimationFrame(schritt);
+}
+
+function ladeNaechsterPhase1Schritt() {
+  if (ladeZustand.phase !== "phase1" || ladeZustand.opencvGemeldet) { return; }
+  var p = ladeZustand.wert;
+  var inc, dauer, pause;
+  if (p < 16) {
+    inc = ladeZufall(7.5, 13.0); dauer = ladeZufall(120, 190); pause = ladeZufall(20, 70);
+  } else if (p < 32) {
+    inc = ladeZufall(4.8, 8.8); dauer = ladeZufall(150, 240); pause = ladeZufall(30, 85);
+  } else if (p < 40) {
+    inc = ladeZufall(2.2, 4.8); dauer = ladeZufall(190, 320); pause = ladeZufall(45, 110);
+  } else if (p < 42.5) {
+    inc = ladeZufall(0.7, 1.7); dauer = ladeZufall(280, 470); pause = ladeZufall(70, 150);
+  } else {
+    inc = ladeZufall(0.10, 0.55); dauer = ladeZufall(850, 1450); pause = ladeZufall(120, 280);
+  }
+  var cap = p < 42.5 ? 42.5 : 49.4;
+  var ziel = Math.min(cap, p + inc);
+  if (ziel <= p + 0.02) { ziel = Math.min(cap, p + 0.08); }
+  ladeGleiteZu(ziel, dauer, ladeEaseInOut, function () {
+    if (ladeZustand.phase !== "phase1" || ladeZustand.opencvGemeldet) { return; }
+    ladeZustand.timer = setTimeout(ladeNaechsterPhase1Schritt, pause);
+  });
+}
+
+function ladeNaechsterPhase2Schritt() {
+  if (ladeZustand.phase !== "phase2" || ladeZustand.pipelineGemeldet) { return; }
+  var p = ladeZustand.wert;
+  var inc, dauer, pause;
+  if (p < 66) {
+    inc = ladeZufall(5.8, 10.5); dauer = ladeZufall(120, 200); pause = ladeZufall(20, 70);
+  } else if (p < 78) {
+    inc = ladeZufall(3.2, 6.4); dauer = ladeZufall(150, 260); pause = ladeZufall(30, 90);
+  } else if (p < 84.5) {
+    inc = ladeZufall(1.4, 3.3); dauer = ladeZufall(220, 380); pause = ladeZufall(45, 120);
+  } else if (p < 88) {
+    inc = ladeZufall(0.45, 1.35); dauer = ladeZufall(360, 680); pause = ladeZufall(80, 180);
+  } else {
+    inc = ladeZufall(0.10, 0.48); dauer = ladeZufall(850, 1450); pause = ladeZufall(120, 280);
+  }
+  var ziel = Math.min(90, p + inc);
+  if (ziel <= p + 0.02) { ziel = Math.min(90, p + 0.08); }
+  ladeGleiteZu(ziel, dauer, ladeEaseInOut, function () {
+    if (ladeZustand.phase !== "phase2" || ladeZustand.pipelineGemeldet) { return; }
+    ladeZustand.timer = setTimeout(ladeNaechsterPhase2Schritt, pause);
+  });
+}
+
+function starteLadePhase1() {
+  ladeZustand.phase = "phase1";
+  ladeNaechsterPhase1Schritt();
+}
+
+function starteLadePhase2() {
+  if (ladeZustand.pipelineGemeldet || ladeZustand.bereitGemeldet) {
+    ladePipelineVorbereitenErreicht();
+    return;
+  }
+  ladeZustand.phase = "phase2";
+  ladeNaechsterPhase2Schritt();
+}
+
+function ladeOpenCVFertig() {
+  if (ladeZustand.opencvGemeldet) { return; }
+  ladeZustand.opencvGemeldet = true;
+  ladeZustand.phase = "opencv-sprung";
+  var ziel = ladeZufall(50, 60);
+  ladeGleiteZu(ziel, ladeZufall(230, 360), ladeEaseOutCubic, function () {
+    ladeZustand.phase = "nach-opencv";
+    if (ladeZustand.pipelineGemeldet || ladeZustand.bereitGemeldet) {
+      ladePipelineVorbereitenErreicht();
+    } else {
+      starteLadePhase2();
+    }
+  });
+}
+
+function ladePipelineVorbereitenErreicht() {
+  ladeZustand.pipelineGemeldet = true;
+  if (!ladeZustand.opencvGemeldet) {
+    ladeOpenCVFertig();
+    return;
+  }
+  if (ladeZustand.phase === "opencv-sprung") { return; }
+  if (ladeZustand.pipelineZu95Gestartet || ladeZustand.pipelineBei95 || ladeZustand.zu100Gestartet) { return; }
+  ladeZustand.pipelineZu95Gestartet = true;
+  ladeZustand.phase = "pipeline-95";
+  ladeGleiteZu(95, ladeZufall(260, 420), ladeEaseOutCubic, function () {
+    ladeZustand.pipelineBei95 = true;
+    ladeZustand.pipeline95Zeit = performance.now();
+    ladeSetzen(95);
+    if (ladeZustand.bereitGemeldet) { ladeAllesBereit(); }
+  });
+}
+
+function ladeAllesBereit(danach) {
+  ladeZustand.bereitGemeldet = true;
+  if (danach) { ladeZustand.bereitCallback = danach; }
+  if (!ladeZustand.pipelineGemeldet) {
+    ladePipelineVorbereitenErreicht();
+    return;
+  }
+  if (!ladeZustand.pipelineBei95) { return; }
+  if (ladeZustand.zu100Gestartet) { return; }
+  var haltBei95 = 180 - (performance.now() - ladeZustand.pipeline95Zeit);
+  if (haltBei95 > 0) {
+    if (ladeZustand.timer) { clearTimeout(ladeZustand.timer); }
+    ladeZustand.timer = setTimeout(function () { ladeAllesBereit(); }, haltBei95);
+    return;
+  }
+  ladeZustand.zu100Gestartet = true;
+  ladeZustand.phase = "fertig-100";
+  ladeGleiteZu(100, ladeZufall(280, 430), ladeEaseOutCubic, function () {
+    ladeSetzen(100);
+    var cb = ladeZustand.bereitCallback;
+    ladeZustand.bereitCallback = null;
+    if (cb) { cb(); }
+  });
+}
+
+function ladeFortschrittVomWorker(n) {
+  var phase = (n.phase || "").toLowerCase();
+  ladeText.textContent = "Wird geladen\u2026";
+  if (phase.indexOf("opencv") !== -1 || (phase && n.prozent === 55)) {
+    ladeOpenCVFertig();
+  }
+  if (phase.indexOf("pipeline") !== -1 || (n.prozent >= 99 && phase)) {
+    ladePipelineVorbereitenErreicht();
+  }
+}
+
+ladeSetzen(0);
+starteLadePhase1();
+
 /* Verhindert, dass die App fuer immer bei "Wird geladen" haengen bleibt:
  * jeder Fehler (und ein "er antwortet einfach nicht mehr"-Wachhund weiter
  * unten) blendet das Lade-Overlay aus und zeigt stattdessen eine klare
@@ -82,6 +293,7 @@ var ladeAbgeschlossen = false; // true sobald "bereit" ODER ein Lade-Fehler kam
 function ladeFehlgeschlagen(text) {
   if (ladeAbgeschlossen) { return; }
   ladeAbgeschlossen = true;
+  ladeAnimationStoppen();
   clearInterval(wachhundTimer);
   ladeOverlay.classList.add("verborgen");
   zeigeMeldung("Start fehlgeschlagen",
@@ -114,17 +326,17 @@ worker.onmessage = function (e) {
   var n = e.data;
   if (n.typ === "fortschritt") {
     letzterFortschritt = Date.now();
-    ladeBalken.style.width = Math.max(2, n.prozent) + "%";
-    ladeText.textContent = (n.phase || "Wird geladen") + " \u2026 " + Math.max(0, n.prozent) + " %";
+    ladeFortschrittVomWorker(n);
   } else if (n.typ === "bereit") {
     workerBereit = true;
     ladeAbgeschlossen = true;
     clearInterval(wachhundTimer);
-    ladeBalken.style.width = "100%";
-    setTimeout(function () {
-      ladeOverlay.classList.add("verborgen");
-      starteKamera();
-    }, 450);
+    ladeAllesBereit(function () {
+      setTimeout(function () {
+        ladeOverlay.classList.add("verborgen");
+        starteKamera();
+      }, 90);
+    });
   } else if (n.typ === "quad") {
     liveOffen = false;
     quadErhalten(n.quad);
@@ -511,7 +723,7 @@ function scanStarten(bilddaten) {
   scanLaeuft = true;
   zuruecksetzenErkennung();
   arbeitOverlay.classList.remove("verborgen");
-  topbarStatus.textContent = "";
+  aktualisiereTopbarStatus();
   var puffer = bilddaten.data.buffer;
   worker.postMessage({
     typ: "scan", rgba: puffer,
@@ -533,7 +745,7 @@ function ergebnisUebernehmen(n) {
   c.toBlob(function (blob) {
     scanFertig();
     if (!blob) { zeigeMeldung("Das hat nicht geklappt", "Das Ergebnis konnte nicht erzeugt werden.", "!"); return; }
-    scans.push({ blob: blob, url: URL.createObjectURL(blob), drehung: 0 });
+    scans.push({ blob: blob, url: URL.createObjectURL(blob), drehung: 0, anzeigeDrehung: 0 });
     zeigeGalerie();
     toast(scans.length === 1 ? "Scan fertig" : scans.length + " Scans");
   }, "image/jpeg", 0.93);
@@ -631,12 +843,33 @@ function ladeBild(blob) {
 }
 
 /* ========================== Galerie ============================= */
+function scanZaehlerText() {
+  return scans.length + (scans.length === 1 ? " Scan" : " Scans");
+}
+
+function aktualisiereTopbarStatus() {
+  if (!scans.length) {
+    topbarStatus.textContent = "";
+    topbarStatus.classList.add("verborgen");
+    return;
+  }
+  var text = scanZaehlerText();
+  topbarStatus.textContent = text;
+  topbarStatus.setAttribute("aria-label", "Zu den fertigen Scans (" + text + ")");
+  topbarStatus.classList.remove("verborgen");
+}
+
+topbarStatus.addEventListener("click", function () {
+  if (!scans.length) { return; }
+  if (galerieScreen.classList.contains("verborgen")) { zeigeGalerie(); }
+});
+
 function zeigeGalerie() {
   liveAktiv = false;
   kameraScreen.classList.add("verborgen");
   galerieScreen.classList.remove("verborgen");
   baueGalerie();
-  topbarStatus.textContent = scans.length + (scans.length === 1 ? " Scan" : " Scans");
+  aktualisiereTopbarStatus();
 }
 
 function zeigeKamera() {
@@ -644,6 +877,7 @@ function zeigeKamera() {
   kameraScreen.classList.remove("verborgen");
   zuruecksetzenErkennung();
   passeOverlayAn();
+  aktualisiereTopbarStatus();
   if (stream) {
     liveAktiv = true;
     schleife();
@@ -655,6 +889,9 @@ function zeigeKamera() {
 function baueGalerie() {
   galerieListe.innerHTML = "";
   scans.forEach(function (s, i) {
+    if (typeof s.anzeigeDrehung !== "number") { s.anzeigeDrehung = normalisiereDrehung(s.drehung || 0); }
+    s.drehung = normalisiereDrehung(s.drehung || 0);
+
     var karte = document.createElement("div");
     karte.className = "scan-karte";
 
@@ -670,8 +907,10 @@ function baueGalerie() {
     drehen.setAttribute("aria-label", "Um 90 Grad drehen");
     drehen.innerHTML = '<svg viewBox="0 0 24 24"><path d="M12 5V2L8 6l4 4V7a5 5 0 1 1-5 5H5a7 7 0 1 0 7-7Z"/></svg>';
     drehen.addEventListener("click", function () {
-      s.drehung = (s.drehung + 90) % 360;
-      bild.style.transform = "rotate(" + s.drehung + "deg)";
+      if (typeof s.anzeigeDrehung !== "number") { s.anzeigeDrehung = normalisiereDrehung(s.drehung || 0); }
+      s.anzeigeDrehung += 90;
+      s.drehung = normalisiereDrehung(s.anzeigeDrehung);
+      setzeBildDrehung(bild, s.anzeigeDrehung);
       passeRahmenAn(rahmen, bild, s.drehung);
     });
     wz.appendChild(drehen);
@@ -687,7 +926,7 @@ function baueGalerie() {
           URL.revokeObjectURL(s.url);
           scans.splice(scans.indexOf(s), 1);
           baueGalerie();
-          topbarStatus.textContent = scans.length + (scans.length === 1 ? " Scan" : " Scans");
+          aktualisiereTopbarStatus();
         }, 300);
       });
       wz.appendChild(weg);
@@ -700,7 +939,7 @@ function baueGalerie() {
     var bild = document.createElement("img");
     bild.src = s.url;
     bild.alt = "Scan " + (i + 1);
-    bild.style.transform = "rotate(" + s.drehung + "deg)";
+    setzeBildDrehung(bild, s.anzeigeDrehung);
     bild.addEventListener("load", function () { passeRahmenAn(rahmen, bild, s.drehung); });
     rahmen.appendChild(bild);
 
@@ -710,30 +949,57 @@ function baueGalerie() {
   });
 }
 
-/* Bei 90/270 Grad muessen Breite und Hoehe getauscht werden */
+function normalisiereDrehung(winkel) {
+  return ((winkel % 360) + 360) % 360;
+}
+
+function setzeBildDrehung(bild, winkel) {
+  bild.style.transform = "translate(-50%, -50%) rotate(" + winkel + "deg)";
+}
+
+function galerieMaxBildHoehe() {
+  var h = window.innerHeight || 800;
+  if (window.matchMedia && window.matchMedia("(max-height: 520px)").matches) { return h * 0.62; }
+  if (window.matchMedia && window.matchMedia("(min-width: 1000px)").matches) { return h * 0.52; }
+  if (window.matchMedia && window.matchMedia("(min-width: 700px)").matches) { return h * 0.46; }
+  return h * 0.58;
+}
+
+/* Bei 90/270 Grad muessen Breite und Hoehe getauscht werden. Das Bild wird
+ * absolut im Mittelpunkt des Rahmens gehalten, damit die Drehung nicht nach
+ * unten aus dem sichtbaren Bereich wandert. */
 function passeRahmenAn(rahmen, bild, drehung) {
-  var quer = (drehung % 180) !== 0;
-  if (!quer || !bild.naturalWidth) {
-    bild.style.maxHeight = "";
-    bild.style.maxWidth = "";
-    rahmen.style.height = "";
-    return;
-  }
-  var breiteRahmen = rahmen.clientWidth || 300;
-  var maxHoehe = Math.min(breiteRahmen, window.innerHeight * 0.58);
+  if (!bild.naturalWidth || !bild.naturalHeight) { return; }
+  var winkel = normalisiereDrehung(drehung || 0);
+  var quer = (winkel % 180) !== 0;
+  var nw = bild.naturalWidth;
+  var nh = bild.naturalHeight;
+  var sichtBreiteNat = quer ? nh : nw;
+  var sichtHoeheNat = quer ? nw : nh;
+  var breiteRahmen = rahmen.clientWidth || (rahmen.parentElement && rahmen.parentElement.clientWidth) || 300;
+  var maxHoehe = galerieMaxBildHoehe();
+  var faktor = Math.min(1, breiteRahmen / sichtBreiteNat, maxHoehe / sichtHoeheNat);
+  var layoutBreite = Math.max(1, nw * faktor);
+  var layoutHoehe = Math.max(1, nh * faktor);
+  var sichtHoehe = Math.max(160, sichtHoeheNat * faktor);
+
+  bild.style.width = Math.round(layoutBreite) + "px";
+  bild.style.height = Math.round(layoutHoehe) + "px";
   bild.style.maxWidth = "none";
-  bild.style.maxHeight = maxHoehe + "px";
-  var angezeigteBreite = maxHoehe * (bild.naturalWidth / bild.naturalHeight);
-  var deckel = window.innerHeight * 0.58;
-  if (angezeigteBreite > deckel) {
-    maxHoehe = maxHoehe * (deckel / angezeigteBreite);
-    angezeigteBreite = deckel;
-    bild.style.maxHeight = maxHoehe + "px";
-  }
-  rahmen.style.height = Math.round(angezeigteBreite) + "px";
+  bild.style.maxHeight = "none";
+  rahmen.style.height = Math.round(sichtHoehe) + "px";
 }
 
 el("btn-weiter-scannen").addEventListener("click", zeigeKamera);
+
+var galerieLayoutTimer = null;
+function planeGalerieLayoutUpdate() {
+  if (galerieScreen.classList.contains("verborgen")) { return; }
+  clearTimeout(galerieLayoutTimer);
+  galerieLayoutTimer = setTimeout(baueGalerie, 90);
+}
+window.addEventListener("resize", planeGalerieLayoutUpdate);
+window.addEventListener("orientationchange", function () { setTimeout(planeGalerieLayoutUpdate, 260); });
 
 /* ========================== Teilen =============================== */
 el("btn-teilen").addEventListener("click", function () { teilenSheet.classList.remove("verborgen"); });
