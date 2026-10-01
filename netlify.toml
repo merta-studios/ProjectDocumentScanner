@@ -1,0 +1,30 @@
+# Netlify-Konfiguration: rein statische Seite, KEIN Build-Schritt.
+# Netlify liest diese Datei automatisch - es muss nichts eingestellt werden.
+
+[build]
+  publish = "."
+
+# Die grossen Python/OpenCV-Dateien sind versioniert -> ewig cachen
+[[headers]]
+  for = "/vendor/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+# Service Worker darf nie veralten
+[[headers]]
+  for = "/sw.js"
+  [headers.values]
+    Cache-Control = "no-cache"
+
+# Die Python-Quellen der Pipeline
+[[headers]]
+  for = "/scanner"
+  [headers.values]
+    Content-Type = "text/x-python; charset=utf-8"
+    Cache-Control = "no-cache"
+
+[[headers]]
+  for = "/scan_wrapper.py"
+  [headers.values]
+    Content-Type = "text/x-python; charset=utf-8"
+    Cache-Control = "no-cache"

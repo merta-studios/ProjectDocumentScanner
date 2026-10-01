@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Dokument-Scanner</title>
+  <meta name="description" content="Dokumente direkt im Browser scannen - ohne Server, ohne Cloud.">
+  <meta name="theme-color" content="#14213d">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Scanner">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header>
+    <h1>📄 Dokument-Scanner</h1>
+  </header>
+
+  <main>
+    <!-- Lade-Karte (erster Start) -->
+    <section id="lade-karte" class="karte">
+      <h2 id="lade-titel">Scanner wird vorbereitet &hellip;</h2>
+      <div class="balken-rahmen" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+        <div id="lade-balken" class="balken"></div>
+      </div>
+      <p id="lade-status" class="status-text">Starte &hellip;</p>
+      <p class="hinweis-klein">
+        Beim allerersten Start werden einmalig ca. 28&nbsp;MB geladen
+        (Python&nbsp;+&nbsp;OpenCV laufen direkt auf diesem Ger&auml;t).
+        Danach ist alles gespeichert und es geht viel schneller.
+      </p>
+    </section>
+
+    <!-- Fehler-Banner -->
+    <section id="fehler-karte" class="karte fehler verborgen">
+      <h2>⚠️ Es ist ein Problem aufgetreten</h2>
+      <p id="fehler-text"></p>
+      <button id="btn-neuladen" class="gross">Seite neu laden</button>
+    </section>
+
+    <!-- Start-Karte -->
+    <section id="start-karte" class="karte verborgen">
+      <p class="anleitung">Fotografiere ein Dokument oder w&auml;hle ein Foto aus deiner Mediathek.</p>
+      <button id="btn-foto" class="gross primaer">📷&nbsp; Foto aufnehmen / ausw&auml;hlen</button>
+      <input type="file" id="datei-input" accept="image/*" hidden>
+    </section>
+
+    <!-- Verarbeitungs-Karte -->
+    <section id="arbeit-karte" class="karte verborgen">
+      <div class="spinner"></div>
+      <h2>Dokument wird gescannt &hellip;</h2>
+      <p class="status-text" id="arbeit-status">Die komplette Scan-Pipeline l&auml;uft jetzt auf deinem Ger&auml;t.
+        Das kann 10&ndash;60 Sekunden dauern &ndash; bitte warten.</p>
+    </section>
+
+    <!-- Ergebnis -->
+    <section id="ergebnis-karte" class="karte verborgen">
+      <div id="meldungen" class="meldungen verborgen"></div>
+      <div class="umschalter">
+        <button id="btn-scan-ansicht" class="tab aktiv">Scan</button>
+        <button id="btn-original-ansicht" class="tab">Original</button>
+      </div>
+      <div class="bild-rahmen">
+        <img id="ergebnis-bild" alt="Gescanntes Dokument">
+      </div>
+      <div class="knopf-reihe">
+        <button id="btn-speichern" class="gross primaer">💾&nbsp; Scan sichern / teilen</button>
+        <button id="btn-neu" class="gross">🔄&nbsp; Neues Foto</button>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>L&auml;uft komplett auf deinem Ger&auml;t &ndash; kein Bild verl&auml;sst das iPad.</p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
