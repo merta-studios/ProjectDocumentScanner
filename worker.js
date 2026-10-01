@@ -50,7 +50,14 @@ self.fetch = function (eingabe, optionen) {
   var dateiname = url.split("/").pop().split("?")[0];
   var bekannt = LADE_DATEIEN[dateiname];
   return originalFetch(eingabe, optionen).then(function (antwort) {
-    if (!bekannt || !antwort.body || !antwort.ok) { return antwort; }
+    /* Pyodides WebAssembly-Loader verwendet diese Antwort direkt für
+     * WebAssembly.instantiateStreaming(). Selbst ein korrekt geklonter
+     * Response kann in Safari/iOS und bei Service-Worker-Responses die
+     * Streaming-Instanziierung blockieren. Die WASM-Antwort darf deshalb
+     * niemals angefasst werden. */
+    if (!bekannt || dateiname === "pyodide.asm.wasm" || !antwort.body || !antwort.ok) {
+      return antwort;
+    }
     geladenProDatei[dateiname] = 0;
     try {
       var klon = antwort.clone();
@@ -71,20 +78,22 @@ self.fetch = function (eingabe, optionen) {
 var pyodide = null;
 
 function initialisieren() {
-  postMessage({ typ: "fortschritt", prozent: 0 });
+  postMessage({ typ: "fortschritt", prozent: 0, phase: "Pyodide wird gestartet" });
   try {
     importScripts(PYODIDE_PFAD + "pyodide.js");
   } catch (f) {
     postMessage({ typ: "fehler", text: "Ultra Scan konnte nicht starten. Bitte die Seite neu laden.", detail: String(f) });
     return Promise.reject(f);
   }
+  postMessage({ typ: "fortschritt", prozent: 1, phase: "Python wird geladen" });
   return loadPyodide({ indexURL: PYODIDE_PFAD })
     .then(function (py) {
       pyodide = py;
+      postMessage({ typ: "fortschritt", prozent: 55, phase: "OpenCV wird geladen" });
       return pyodide.loadPackage(["numpy", "opencv-python"]);
     })
     .then(function () {
-      postMessage({ typ: "fortschritt", prozent: 99 });
+      postMessage({ typ: "fortschritt", prozent: 99, phase: "Pipeline wird vorbereitet" });
       /* Originaldatei "scanner" UNVERAENDERT laden und nur im virtuellen
        * Pyodide-Dateisystem unter dem importierbaren Namen scanner.py
        * ablegen. Die Datei im Repository bleibt byte-identisch. */
