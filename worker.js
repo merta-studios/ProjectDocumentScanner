@@ -4,8 +4,11 @@
  * Laedt Pyodide (Python als WebAssembly) + NumPy + OpenCV und fuehrt die
  * ORIGINAL-Pipeline (Datei "scanner" im Repo, unveraendert) ueber die
  * Wrapper-Datei scan_wrapper.py aus:
- *   - "live": nur scanner.find_rough_quad() auf einem Mini-Frame
  *   - "scan": kompletter Ultra Scan (Hybrid-Ergebnis)
+ *
+ * Die Live-Erkennung im Sucher laeuft NICHT mehr hier, sondern in
+ * detect.js / detect-worker.js (reines JavaScript, ~8 ms je Bild statt
+ * ~200 ms ueber Python).
  *
  * Alles liegt lokal unter vendor/pyodide-0.27.7/ - kein fremdes CDN.
  */
@@ -123,34 +126,27 @@ function initialisieren() {
 var initPromise = initialisieren();
 initPromise.catch(function () { /* bereits gemeldet */ });
 
-/* --------------------------- Live-Erkennung --------------------------- */
-function live(n) {
-  var rgba = new Uint8Array(n.rgba);
-  pyodide.globals.set("rgba_js", rgba);
-  pyodide.globals.set("hoehe_js", n.hoehe);
-  pyodide.globals.set("breite_js", n.breite);
-  var proxy = pyodide.runPython(
-    "import json, scan_wrapper\n" +
-    "json.dumps(scan_wrapper.quad_aus_rgba(rgba_js.to_py(), hoehe_js, breite_js))\n"
-  );
-  pyodide.globals.delete("rgba_js");
-  postMessage({ typ: "quad", quad: JSON.parse(proxy) });
-}
-
 /* ----------------------------- Vollscan ------------------------------- */
 function scannen(n) {
   var rgba = new Uint8Array(n.rgba);
   pyodide.globals.set("rgba_js", rgba);
   pyodide.globals.set("hoehe_js", n.hoehe);
   pyodide.globals.set("breite_js", n.breite);
+  /* Viereck-Hinweis aus der Live-Erkennung (detect.js). Die Pipeline muss
+   * das Dokument dann nicht noch einmal suchen, sondern zieht nur noch die
+   * Kanten im grossen Bild nach - das Ergebnis sitzt dadurch genau dort,
+   * wo im Sucher der Rahmen stand. */
+  pyodide.globals.set("quad_js", n.quad ? JSON.stringify(n.quad) : null);
   var proxy = pyodide.runPython(
     "import json, scan_wrapper\n" +
-    "_out, _h, _w, _info = scan_wrapper.scan_rgba_streng(rgba_js.to_py(), hoehe_js, breite_js)\n" +
+    "_q = json.loads(quad_js) if quad_js else None\n" +
+    "_out, _h, _w, _info = scan_wrapper.scan_rgba_streng(rgba_js.to_py(), hoehe_js, breite_js, _q)\n" +
     "(_out, _h, _w, json.dumps(_info))\n"
   );
   var ergebnis = proxy.toJs();
   proxy.destroy();
   pyodide.globals.delete("rgba_js");
+  pyodide.globals.delete("quad_js");
   var info = JSON.parse(ergebnis[3]);
   if (!info.dokument_erkannt || !ergebnis[0]) {
     postMessage({ typ: "keindokument" });
@@ -168,16 +164,12 @@ function scannen(n) {
 
 self.onmessage = function (e) {
   var n = e.data;
-  if (n.typ !== "scan" && n.typ !== "live") { return; }
+  if (n.typ !== "scan") { return; }
   initPromise.then(function () {
     try {
-      if (n.typ === "live") { live(n); } else { scannen(n); }
+      scannen(n);
     } catch (f) {
-      if (n.typ === "live") {
-        postMessage({ typ: "quad", quad: null });
-      } else {
-        postMessage({ typ: "fehler", text: "Der Scan hat nicht geklappt. Bitte noch einmal versuchen.", detail: String(f) });
-      }
+      postMessage({ typ: "fehler", text: "Der Scan hat nicht geklappt. Bitte noch einmal versuchen.", detail: String(f) });
     }
   }).catch(function () { /* Init-Fehler wurde bereits gemeldet */ });
 };

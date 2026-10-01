@@ -11,11 +11,27 @@
 /* ========================== Konstanten ========================== */
 var MAX_KANTE       = 1600;   // laengste Kante fuer die Pipeline
 var LIVE_KANTE      = 320;    // laengste Kante fuer die Live-Erkennung
-var MIN_FLAECHE     = 0.17;   // Viereck muss >= 17 % des Bildes fuellen
-var STABIL_PIXEL    = 0.035;  // max. Eckenwanderung (Anteil der Bilddiagonale)
-var STABIL_FRAMES   = 3;      // so viele gute Frames in Folge
-var RUHE_SCHWELLE   = 7.0;    // mittlere Helligkeitsaenderung je Pixel
-var COUNTDOWN_MS    = 900;
+var MIN_FLAECHE     = 0.09;   // Viereck muss >= 9 % des Bildes fuellen
+
+/* --- Automatischer Ausloeser -------------------------------------------
+ * Frueher: 3 gute Frames IN FOLGE, jeder Aussetzer setzte alles auf 0
+ * zurueck, und als "Bewegung" galt schon eine Helligkeitsaenderung.
+ * Auf einem iPad war das praktisch nie erfuellbar.
+ *
+ * Jetzt: eine Bereitschaft, die waehrend ruhiger Frames WAECHST und bei
+ * Stoerungen nur langsam faellt. Kurzes Wackeln kostet etwas Fortschritt,
+ * wirft aber nicht zurueck auf Null. Beurteilt wird die Lage der Ecken
+ * ueber ein Zeitfenster (echtes Zittern) statt der Unterschied zweier
+ * aufeinanderfolgender Frames. */
+var FENSTER_MS      = 420;    // Beobachtungsfenster fuer die Ruhe-Messung
+var ZITTER_MAX      = 0.028;  // erlaubtes Zittern (Anteil der Diagonale)
+var TEMPO_MAX       = 0.30;   // erlaubte Wanderung je Sekunde (Anteil Diag.)
+var BEWEGUNG_MAX    = 0.85;   // belichtungsbereinigte Bildbewegung
+var SCHAERFE_ANTEIL = 0.33;   // mind. 33 % der zuletzt besten Schaerfe
+var AUFBAU_MS       = 620;    // so lange ruhig halten -> Ausloesung
+var ABBAU_MS        = 1700;   // so langsam faellt die Bereitschaft wieder
+var VERLUST_MS      = 520;    // so lange darf die Erkennung aussetzen
+var HINWEIS_RUHE_MS = 280;    // Mindeststandzeit eines Hinweistextes
 
 /* ========================== Elemente ============================ */
 function el(id) { return document.getElementById(id); }
@@ -49,7 +65,6 @@ var ctx = overlay.getContext("2d");
 /* ========================== Zustand ============================= */
 var workerBereit  = false;
 var scanLaeuft    = false;
-var liveOffen     = false;        // Live-Anfrage unterwegs
 var liveAktiv     = false;        // Erkennungsschleife laeuft
 var stream        = null;
 var kameraRichtung= "environment";
@@ -58,12 +73,14 @@ var zoomMax       = 5;
 var trackZoom     = null;         // native Zoom-Faehigkeit (falls vorhanden)
 var scans         = [];           // { blob, url, drehung }
 var letzterQuad   = null;         // gezeichnetes (geglaettetes) Viereck
-var zielQuad      = null;
-var gutFrames     = 0;
-var countdownBis  = 0;
-var countdownAn   = false;
-var letztesGrau   = null;
-var ruheWert      = 999;
+var zielQuad      = null;         // letzte Messung (Overlay-Koordinaten)
+var verlauf       = [];           // Messungen im Zeitfenster
+var letzteMessung = 0;
+var verdaechtig   = null;         // Ausreisser, der noch bestaetigt werden muss
+var schaerfeJetzt = 0, schaerfeBest = 1, schaerfeBestZeit = 0;
+var bewegungJetzt = -1;
+var bereitschaft  = 0;            // 0..1 Ausloese-Bereitschaft
+var ringAn        = false;
 var geradeAusgeloest = false;
 
 /* ======================= Service Worker ========================= */
@@ -337,9 +354,6 @@ worker.onmessage = function (e) {
         starteKamera();
       }, 90);
     });
-  } else if (n.typ === "quad") {
-    liveOffen = false;
-    quadErhalten(n.quad);
   } else if (n.typ === "ergebnis") {
     ergebnisUebernehmen(n);
   } else if (n.typ === "keindokument") {
@@ -353,7 +367,6 @@ worker.onmessage = function (e) {
       ladeFehlgeschlagen(n.text);
       return;
     }
-    liveOffen = false;
     scanFertig();
     zeigeMeldung("Das hat nicht geklappt", n.text || "Bitte noch einmal versuchen.", "!");
   }
@@ -499,52 +512,138 @@ function liveFrame() {
   return { daten: liveCtx.getImageData(0, 0, w, h), breite: w, hoehe: h, aus: a };
 }
 
-/* Ruhe-Messung: mittlere Helligkeitsaenderung zwischen zwei Frames */
-function messeRuhe(bilddaten) {
-  var d = bilddaten.data, n = d.length / 4;
-  var schritt = Math.max(1, Math.floor(n / 2400));
-  var grau = [];
-  for (var i = 0; i < n; i += schritt) {
-    var p = i * 4;
-    grau.push((d[p] * 299 + d[p + 1] * 587 + d[p + 2] * 114) / 1000);
+/* ================= Erkennungs-Worker (reines JS) ================
+ * Die Live-Erkennung laeuft NICHT mehr ueber Python/Pyodide (das schaffte
+ * nur ~5 Bilder je Sekunde und zitterte stark), sondern in detect.js in
+ * einem eigenen, winzigen Worker - mit voller Bildrate. */
+var erkWorker = new Worker("detect-worker.js");
+var erkOffen = false;
+var erkFolge = 0;
+var erkAnfragen = {};
+var standbildWartet = {};
+var standbildMarke = 0;
+
+erkWorker.onmessage = function (e) {
+  var n = e.data;
+  if (n.typ === "quad") {
+    erkOffen = false;
+    var info = erkAnfragen[n.folge];
+    delete erkAnfragen[n.folge];
+    messungAufnehmen(n, info);
+  } else if (n.typ === "standbild") {
+    var auftrag = standbildWartet[n.marke];
+    delete standbildWartet[n.marke];
+    if (auftrag) { auftrag(n.quad, n.konfidenz); }
   }
-  if (letztesGrau && letztesGrau.length === grau.length) {
-    var s = 0;
-    for (var j = 0; j < grau.length; j++) { s += Math.abs(grau[j] - letztesGrau[j]); }
-    ruheWert = s / grau.length;
-  }
-  letztesGrau = grau;
+};
+erkWorker.onerror = function () { erkOffen = false; };
+
+/* Eckpunkte aus der Erkennung in Overlay-Koordinaten umrechnen */
+function nachOverlay(quad, info) {
+  var sx = info.ew / info.w, sy = info.eh / info.h;
+  return quad.map(function (p) { return [p[0] * sx, p[1] * sy]; });
 }
 
-var letzteLive = 0;
+function overlayDiagonale() {
+  return Math.hypot(overlay.clientWidth, overlay.clientHeight) || 1;
+}
+
+function quadAbstand(a, b) {
+  if (!a || !b) { return 1e9; }
+  var m = 0;
+  for (var i = 0; i < 4; i++) {
+    m = Math.max(m, Math.hypot(a[i][0] - b[i][0], a[i][1] - b[i][1]));
+  }
+  return m;
+}
+
+function messungAufnehmen(n, info) {
+  var jetzt = performance.now();
+  /* Schaerfe-Bestwert langsam verfallen lassen: so bleibt der Massstab
+   * bei wechselndem Licht / Motiv realistisch. */
+  if (typeof n.schaerfe === "number" && n.schaerfe > 0) {
+    schaerfeJetzt = n.schaerfe;
+    if (n.schaerfe > schaerfeBest || jetzt - schaerfeBestZeit > 2500) {
+      schaerfeBest = Math.max(n.schaerfe, schaerfeBest * 0.6);
+      schaerfeBestZeit = jetzt;
+    }
+  }
+  if (typeof n.bewegung === "number") { bewegungJetzt = n.bewegung; }
+
+  if (!n.quad || !info) { return; }
+  var q = nachOverlay(n.quad, info);
+  var diag = overlayDiagonale();
+
+  /* Ausreisser-Schutz: ein einzelner Fehlgriff darf den Rahmen nicht
+   * wegspringen lassen - er muss im naechsten Bild bestaetigt werden. */
+  if (zielQuad && jetzt - letzteMessung < 400 &&
+      quadAbstand(q, zielQuad) > 0.3 * diag) {
+    if (!verdaechtig || quadAbstand(q, verdaechtig) > 0.12 * diag) {
+      verdaechtig = q;
+      return;
+    }
+  }
+  verdaechtig = null;
+
+  zielQuad = q;
+  letzteMessung = jetzt;
+  verlauf.push({ t: jetzt, q: q });
+  while (verlauf.length > 2 && jetzt - verlauf[0].t > FENSTER_MS) { verlauf.shift(); }
+}
+
+/* Zittern (Abweichung von der mittleren Lage) und Wandergeschwindigkeit */
+function ruheMasse() {
+  if (verlauf.length < 3) { return null; }
+  var spanne = verlauf[verlauf.length - 1].t - verlauf[0].t;
+  if (spanne < 140) { return null; }
+  var diag = overlayDiagonale(), i, k;
+  var zitter = 0;
+  for (k = 0; k < 4; k++) {
+    var mx = 0, my = 0;
+    for (i = 0; i < verlauf.length; i++) {
+      mx += verlauf[i].q[k][0] / verlauf.length;
+      my += verlauf[i].q[k][1] / verlauf.length;
+    }
+    for (i = 0; i < verlauf.length; i++) {
+      var d = Math.hypot(verlauf[i].q[k][0] - mx, verlauf[i].q[k][1] - my);
+      if (d > zitter) { zitter = d; }
+    }
+  }
+  var weg = 0;
+  for (k = 0; k < 4; k++) {
+    weg += Math.hypot(verlauf[verlauf.length - 1].q[k][0] - verlauf[0].q[k][0],
+                      verlauf[verlauf.length - 1].q[k][1] - verlauf[0].q[k][1]) / 4;
+  }
+  return { zitter: zitter / diag, tempo: (weg / diag) / (spanne / 1000) };
+}
+
+/* =========================== Schleife =========================== */
+var letzteSendung = 0;
+var letzterRahmen = 0;
+
 function schleife() {
   if (!liveAktiv) { return; }
   requestAnimationFrame(schleife);
   var jetzt = performance.now();
 
-  if (!scanLaeuft && !liveOffen && workerBereit && jetzt - letzteLive > 90 &&
-      video.readyState >= 2 && !geradeAusgeloest) {
+  if (!scanLaeuft && !geradeAusgeloest && !erkOffen &&
+      video.readyState >= 2 && jetzt - letzteSendung > 28) {
     var f = liveFrame();
     if (f) {
-      letzteLive = jetzt;
-      messeRuhe(f.daten);
-      liveOffen = true;
-      var puffer = f.daten.data.buffer.slice(0);
-      worker.postMessage({ typ: "live", rgba: puffer, breite: f.breite, hoehe: f.hoehe }, [puffer]);
-      liveSkala = { ew: f.aus.ew, eh: f.aus.eh, w: f.breite, h: f.hoehe };
+      letzteSendung = jetzt;
+      erkFolge++;
+      erkAnfragen[erkFolge] = { ew: f.aus.ew, eh: f.aus.eh, w: f.breite, h: f.hoehe };
+      erkOffen = true;
+      var puffer = f.daten.data.buffer;
+      erkWorker.postMessage({ typ: "live", rgba: puffer, breite: f.breite,
+                              hoehe: f.hoehe, folge: erkFolge }, [puffer]);
     }
   }
 
-  zeichne();
-  pruefeAusloeser(jetzt);
-}
-
-var liveSkala = null;
-
-function quadErhalten(q) {
-  if (!q || !liveSkala) { zielQuad = null; return; }
-  var sx = liveSkala.ew / liveSkala.w, sy = liveSkala.eh / liveSkala.h;
-  zielQuad = q.map(function (p) { return [p[0] * sx, p[1] * sy]; });
+  var dt = letzterRahmen ? Math.min(100, jetzt - letzterRahmen) : 16;
+  letzterRahmen = jetzt;
+  zeichne(dt);
+  pruefeAusloeser(jetzt, dt);
 }
 
 function flaecheAnteil(q) {
@@ -557,41 +656,46 @@ function flaecheAnteil(q) {
   return Math.abs(a / 2) / (overlay.clientWidth * overlay.clientHeight);
 }
 
-function quadAbstand(a, b) {
-  if (!a || !b) { return 1e9; }
-  var m = 0;
-  for (var i = 0; i < 4; i++) {
-    m = Math.max(m, Math.hypot(a[i][0] - b[i][0], a[i][1] - b[i][1]));
-  }
-  return m;
-}
-
+/* ========================== Zeichnen ============================ */
 var puls = 0;
-function zeichne() {
+function zeichne(dt) {
   var w = overlay.clientWidth, h = overlay.clientHeight;
   ctx.clearRect(0, 0, w, h);
   puls += 0.04;
 
-  /* weiches Nachfuehren der Ecken */
-  if (zielQuad) {
-    if (!letzterQuad) {
-      letzterQuad = zielQuad.map(function (p) { return [p[0], p[1]]; });
-    } else {
-      for (var i = 0; i < 4; i++) {
-        letzterQuad[i][0] += (zielQuad[i][0] - letzterQuad[i][0]) * 0.28;
-        letzterQuad[i][1] += (zielQuad[i][1] - letzterQuad[i][1]) * 0.28;
-      }
+  var frisch = zielQuad && (performance.now() - letzteMessung) < VERLUST_MS;
+  if (!frisch) {
+    /* Rahmen weich ausblenden statt hart verschwinden lassen */
+    if (letzterQuad) {
+      letzterQuad.alpha = (letzterQuad.alpha === undefined ? 1 : letzterQuad.alpha) - dt / 220;
+      if (letzterQuad.alpha <= 0) { letzterQuad = null; }
     }
+  } else if (!letzterQuad) {
+    letzterQuad = zielQuad.map(function (p) { return [p[0], p[1]]; });
+    letzterQuad.alpha = 1;
   } else {
-    letzterQuad = null;
+    /* Adaptive Glaettung: kleine Abweichungen stark daempfen (kein
+     * Zittern), grosse Bewegungen schnell nachfuehren (kein Nachziehen). */
+    var diag = overlayDiagonale();
+    var fehler = quadAbstand(zielQuad, letzterQuad) / diag;
+    var basis = Math.min(0.85, 0.14 + 3.2 * fehler);
+    var a = 1 - Math.pow(1 - basis, dt / 16.7);
+    for (var i = 0; i < 4; i++) {
+      letzterQuad[i][0] += (zielQuad[i][0] - letzterQuad[i][0]) * a;
+      letzterQuad[i][1] += (zielQuad[i][1] - letzterQuad[i][1]) * a;
+    }
+    letzterQuad.alpha = Math.min(1, (letzterQuad.alpha === undefined ? 1 : letzterQuad.alpha) + dt / 160);
   }
+
   var q = letzterQuad;
   if (!q) { return; }
 
-  var stark = gutFrames >= STABIL_FRAMES;
+  var stark = bereitschaft > 0.12;
   var glanz = 0.5 + 0.5 * Math.sin(puls);
+  var sicht = Math.max(0, Math.min(1, q.alpha === undefined ? 1 : q.alpha));
 
   ctx.save();
+  ctx.globalAlpha = sicht;
   ctx.beginPath();
   ctx.moveTo(q[0][0], q[0][1]);
   for (var k = 1; k < 4; k++) { ctx.lineTo(q[k][0], q[k][1]); }
@@ -615,6 +719,8 @@ function zeichne() {
   ctx.restore();
 
   /* Ecken */
+  ctx.save();
+  ctx.globalAlpha = sicht;
   for (var e = 0; e < 4; e++) {
     var rad = (stark ? 9 : 6.5) + (stark ? 1.6 * glanz : 0);
     ctx.beginPath();
@@ -625,77 +731,95 @@ function zeichne() {
     ctx.fill();
     ctx.shadowBlur = 0;
   }
+  ctx.restore();
 }
 
 /* ==================== Automatischer Ausloeser ==================== */
-var letzteBewertung = null;
-function pruefeAusloeser(jetzt) {
-  if (scanLaeuft || geradeAusgeloest || !zielQuad) {
-    gutFrames = 0;
-    countdownAbbrechen();
+function pruefeAusloeser(jetzt, dt) {
+  if (scanLaeuft || geradeAusgeloest) {
+    bereitschaftSetzen(0);
     setHinweis(scanLaeuft ? "" : "Dokument anvisieren", false);
-    letzteBewertung = null;
     return;
   }
 
-  var flaeche = flaecheAnteil(zielQuad);
-  var stabil = quadAbstand(zielQuad, letzteBewertung) <
-               STABIL_PIXEL * Math.hypot(overlay.clientWidth, overlay.clientHeight);
-  letzteBewertung = zielQuad.map(function (p) { return [p[0], p[1]]; });
-  var ruhig = ruheWert < RUHE_SCHWELLE;
+  var frisch = zielQuad && (jetzt - letzteMessung) < VERLUST_MS;
+  if (!frisch) {
+    bereitschaftAendern(-dt / ABBAU_MS);
+    setHinweis("Dokument anvisieren", false);
+    if (zielQuad && jetzt - letzteMessung > 1200) { verlauf.length = 0; zielQuad = null; }
+    return;
+  }
 
-  if (flaeche < MIN_FLAECHE) {
-    gutFrames = 0;
-    countdownAbbrechen();
+  if (flaecheAnteil(zielQuad) < MIN_FLAECHE) {
+    bereitschaftAendern(-dt / ABBAU_MS);
     setHinweis("N\u00e4her herangehen", false);
     return;
   }
-  if (!stabil || !ruhig) {
-    gutFrames = 0;
-    countdownAbbrechen();
-    setHinweis("Ruhig halten", false);
+
+  var ruhe = ruheMasse();
+  var unruhig = !ruhe || ruhe.zitter > ZITTER_MAX || ruhe.tempo > TEMPO_MAX ||
+                (bewegungJetzt >= 0 && bewegungJetzt > BEWEGUNG_MAX);
+  if (unruhig) {
+    /* nur bruchteilhaft zurueck - kurzes Wackeln kostet keinen Neustart */
+    bereitschaftAendern(-dt / ABBAU_MS);
+    setHinweis(bereitschaft > 0.25 ? "Fast geschafft" : "Ruhig halten", false);
     return;
   }
 
-  gutFrames++;
+  /* bewegungsunscharfe Frames nicht aufnehmen */
+  if (schaerfeJetzt > 0 && schaerfeJetzt < SCHAERFE_ANTEIL * schaerfeBest) {
+    bereitschaftAendern(-dt / (2 * ABBAU_MS));
+    setHinweis("Sch\u00e4rfe wird gesucht", false);
+    return;
+  }
+
+  bereitschaftAendern(dt / AUFBAU_MS);
   setHinweis("Dokument erkannt", true);
-  if (gutFrames >= STABIL_FRAMES) {
-    if (!countdownAn) {
-      countdownAn = true;
-      countdownBis = jetzt + COUNTDOWN_MS;
-      ringBox.classList.add("aktiv");
-    }
-    var rest = Math.max(0, countdownBis - jetzt);
-    ringFg.style.strokeDashoffset = String(327 * (rest / COUNTDOWN_MS));
-    if (rest <= 0) { ausloesen(); }
-  }
+  if (bereitschaft >= 1) { ausloesen(); }
 }
 
-function countdownAbbrechen() {
-  if (countdownAn) {
-    countdownAn = false;
-    ringBox.classList.remove("aktiv");
-    ringFg.style.strokeDashoffset = "327";
-  }
+function bereitschaftAendern(delta) {
+  bereitschaftSetzen(bereitschaft + delta);
 }
 
+function bereitschaftSetzen(wert) {
+  bereitschaft = Math.max(0, Math.min(1, wert));
+  var sichtbar = bereitschaft > 0.04;
+  if (sichtbar !== ringAn) {
+    ringAn = sichtbar;
+    ringBox.classList.toggle("aktiv", sichtbar);
+  }
+  ringFg.style.strokeDashoffset = String(327 * (1 - bereitschaft));
+}
+
+/* Hinweistexte mit Beruhigung: ein Text muss sich erst "durchsetzen",
+ * bevor er angezeigt wird. Sonst flackert die Zeile bei jedem Frame. */
+var hinweisZiel = "", hinweisZielGut = false, hinweisSeit = 0, hinweisAktuell = null;
 function setHinweis(text, gut) {
-  if (!text) { hinweis.classList.add("verborgen"); return; }
-  hinweis.classList.remove("verborgen");
-  if (hinweis.textContent !== text) { hinweis.textContent = text; }
-  hinweis.classList.toggle("gut", !!gut);
-  autoPille.classList.toggle("scharf", !!gut);
+  var jetzt = performance.now();
+  if (text !== hinweisZiel) { hinweisZiel = text; hinweisZielGut = gut; hinweisSeit = jetzt; }
+  var reif = (jetzt - hinweisSeit) >= HINWEIS_RUHE_MS;
+  if (hinweisAktuell === null || reif || text === hinweisAktuell) {
+    if (hinweisAktuell !== text) { hinweisAktuell = text; }
+    if (!text) { hinweis.classList.add("verborgen"); autoPille.classList.remove("scharf"); return; }
+    hinweis.classList.remove("verborgen");
+    if (hinweis.textContent !== text) { hinweis.textContent = text; }
+    hinweis.classList.toggle("gut", !!gut);
+    autoPille.classList.toggle("scharf", !!gut);
+  }
 }
 
 function zuruecksetzenErkennung() {
-  zielQuad = null; letzterQuad = null; gutFrames = 0;
-  letzteBewertung = null; letztesGrau = null; ruheWert = 999;
-  countdownAbbrechen();
+  zielQuad = null; letzterQuad = null; verdaechtig = null;
+  verlauf.length = 0; letzteMessung = 0;
+  bewegungJetzt = -1; schaerfeJetzt = 0; schaerfeBest = 1; schaerfeBestZeit = 0;
+  bereitschaftSetzen(0);
+  hinweisAktuell = null; hinweisZiel = "";
 }
 
 function ausloesen() {
   geradeAusgeloest = true;
-  countdownAbbrechen();
+  bereitschaftSetzen(0);
   blitzen();
   if (navigator.vibrate) { try { navigator.vibrate(18); } catch (f) {} }
   var a = sichtbarerAusschnitt();
@@ -708,7 +832,18 @@ function ausloesen() {
   var cc = c.getContext("2d");
   cc.drawImage(video, a.sx, a.sy, a.sw, a.sh, 0, 0, cw, ch);
   var bd = cc.getImageData(0, 0, cw, ch);
-  scanStarten(bd);
+
+  /* Das live erkannte Viereck wird in Bildkoordinaten der Aufnahme
+   * umgerechnet und mitgegeben: die Pipeline muss das Dokument dann nicht
+   * noch einmal von Null suchen, sondern zieht nur noch die Kanten im
+   * grossen Bild nach. Das Ergebnis sitzt damit genau dort, wo der
+   * Rahmen im Sucher stand. */
+  var hinweisQuad = null;
+  if (letzterQuad && overlay.clientWidth) {
+    var sx = cw / overlay.clientWidth, sy = ch / overlay.clientHeight;
+    hinweisQuad = letzterQuad.map(function (p) { return [p[0] * sx, p[1] * sy]; });
+  }
+  scanStarten(bd, hinweisQuad);
 }
 
 function blitzen() {
@@ -719,7 +854,7 @@ function blitzen() {
 }
 
 /* ========================== Scannen ============================= */
-function scanStarten(bilddaten) {
+function scanStarten(bilddaten, quadHinweis) {
   scanLaeuft = true;
   zuruecksetzenErkennung();
   arbeitOverlay.classList.remove("verborgen");
@@ -727,8 +862,31 @@ function scanStarten(bilddaten) {
   var puffer = bilddaten.data.buffer;
   worker.postMessage({
     typ: "scan", rgba: puffer,
-    breite: bilddaten.width, hoehe: bilddaten.height
+    breite: bilddaten.width, hoehe: bilddaten.height,
+    quad: quadHinweis || null
   }, [puffer]);
+}
+
+/* Fuer Bilder OHNE Live-Erkennung (Foto, Datei, Zwischenablage): erst die
+ * Ecken in voller Aufloesung suchen, dann scannen. Damit findet die App
+ * auch auf mitgebrachten Fotos ein Dokument, wo die alte Pipeline
+ * "Kein Dokument gefunden" gemeldet hat. */
+function scanMitVorerkennung(bilddaten) {
+  var kopie = new Uint8ClampedArray(bilddaten.data);  // Puffer wird uebertragen
+  standbildMarke++;
+  var marke = standbildMarke;
+  var fertig = false;
+  var los = function (quad) {
+    if (fertig) { return; }
+    fertig = true;
+    scanStarten(bilddaten, quad || null);
+  };
+  standbildWartet[marke] = function (quad) { los(quad); };
+  setTimeout(function () { los(null); }, 4000);        // Notbremse
+  erkWorker.postMessage({
+    typ: "standbild", marke: marke, rgba: kopie.buffer,
+    breite: bilddaten.width, hoehe: bilddaten.height
+  }, [kopie.buffer]);
 }
 
 function scanFertig() {
@@ -811,7 +969,7 @@ function bildVerarbeiten(blob) {
   if (scanLaeuft) { return; }
   arbeitOverlay.classList.remove("verborgen");
   ladeBild(blob).then(function (bd) {
-    scanStarten(bd);
+    scanMitVorerkennung(bd);
   }).catch(function () {
     arbeitOverlay.classList.add("verborgen");
     zeigeMeldung("Bild nicht lesbar", "Dieses Format kann nicht ge\u00f6ffnet werden. Versuche ein JPEG oder PNG.", "!");
