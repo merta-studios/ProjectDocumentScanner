@@ -1,13 +1,14 @@
 /*
- * Ultra Scan - Service Worker: sorgt dafuer, dass die grossen Python/OpenCV-Dateien
- * (ca. 28 MB) nach dem ersten Besuch dauerhaft gespeichert sind und die
- * App danach blitzschnell (und sogar offline) startet.
+ * Ultra Scan - Service Worker: sorgt dafuer, dass die grossen Dateien
+ * (Pyodide/OpenCV ca. 28 MB, ONNX Runtime + KI-Modell ca. 16 MB) nach dem
+ * ersten Besuch dauerhaft gespeichert sind und die App danach
+ * blitzschnell (und sogar offline) startet.
  */
 "use strict";
 
 /* Version bei jeder Änderung der Startlogik erhöhen: so wird kein alter,
  * möglicherweise unvollständiger Worker aus dem Browser-Cache verwendet. */
-var CACHE_NAME = "ultra-scan-v4";
+var CACHE_NAME = "ultra-scan-v5";
 
 self.addEventListener("install", function (e) {
   self.skipWaiting();
@@ -29,8 +30,11 @@ self.addEventListener("fetch", function (e) {
   var url = new URL(anfrage.url);
   if (url.origin !== self.location.origin) { return; }
 
-  if (url.pathname.indexOf("/vendor/") !== -1 || url.pathname.indexOf("/icons/") !== -1) {
-    /* grosse, versionierte Dateien: Cache zuerst */
+  if (url.pathname.indexOf("/vendor/") !== -1 ||
+      url.pathname.indexOf("/models/") !== -1 ||
+      url.pathname.indexOf("/icons/") !== -1) {
+    /* grosse, versionierte Dateien (Pyodide, ONNX Runtime, KI-Modell):
+     * Cache zuerst - die aendern sich nur mit einer neuen Version. */
     e.respondWith(
       caches.open(CACHE_NAME).then(function (cache) {
         return cache.match(anfrage).then(function (treffer) {

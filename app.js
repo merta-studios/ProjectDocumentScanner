@@ -52,6 +52,7 @@ var quelleSheet  = el("quelle-sheet");
 var teilenSheet  = el("teilen-sheet");
 var hinweis      = el("kamera-hinweis");
 var autoPille    = el("auto-pille");
+var stilPille    = el("stil-pille");
 var ringBox      = el("ausloeser-ring");
 var ringFg       = el("ring-fg");
 var zoomPille    = el("zoom-pille");
@@ -538,6 +539,73 @@ erkWorker.onmessage = function (e) {
 };
 erkWorker.onerror = function () { erkOffen = false; };
 
+/* ================== KI-Erkennung (neuronales Netz) ==============
+ *
+ * Zweiter, eigener Worker. Er schaetzt die vier Dokument-Ecken mit dem
+ * DocAligner-Modell (siehe models/HERKUNFT.md) und braucht dafuer rund
+ * 100-200 ms. Die schnelle Geometrie in erkWorker laeuft davon voellig
+ * unbeeindruckt weiter - das zuletzt gelieferte KI-Viereck wird dort nur
+ * als zusaetzlicher Kandidat mitbewertet.
+ *
+ * Faellt der Worker aus (altes Safari ohne Modul-Worker, Modell nicht
+ * ladbar, zu wenig Speicher), arbeitet die App exakt wie vorher weiter.
+ * Die KI ist eine Verbesserung, keine Voraussetzung. */
+var kiWorker = null;
+var kiBereit = false;
+var kiOffen = false;
+var kiLetzte = null;            // { quad, konf, zeit, w, h }
+var kiStandbild = {};
+var kiLetzteSendung = 0;
+var KI_HALTBAR_MS = 700;        // aelter -> nicht mehr verwenden
+var KI_ABSTAND_MS = 60;         // Mindestabstand zweier KI-Anfragen
+
+try {
+  kiWorker = new Worker("nn-worker.js", { type: "module" });
+} catch (f) {
+  kiWorker = null;
+}
+
+if (kiWorker) {
+  kiWorker.onmessage = function (e) {
+    var n = e.data;
+    if (!n) { return; }
+    if (n.typ === "ki-status") {
+      kiBereit = !!n.bereit;
+      if (!kiBereit) {
+        console.warn("KI-Erkennung nicht verfuegbar:", n.meldung);
+      }
+      return;
+    }
+    if (n.typ === "ki") {
+      kiOffen = false;
+      if (n.quad) {
+        kiLetzte = { quad: n.quad, konf: n.konfidenz, zeit: performance.now() };
+      } else if (!n.uebersprungen) {
+        kiLetzte = null;
+      }
+      return;
+    }
+    if (n.typ === "ki-standbild") {
+      var auftrag = kiStandbild[n.marke];
+      delete kiStandbild[n.marke];
+      if (auftrag) { auftrag(n.quad, n.konfidenz); }
+    }
+  };
+  kiWorker.onerror = function (f2) {
+    console.warn("KI-Worker gestoppt:", f2 && f2.message);
+    kiOffen = false;
+    kiBereit = false;
+    kiWorker = null;
+  };
+}
+
+/* Frisches KI-Viereck fuer den naechsten Frame (oder null) */
+function kiHinweis() {
+  if (!kiLetzte) { return null; }
+  if (performance.now() - kiLetzte.zeit > KI_HALTBAR_MS) { return null; }
+  return kiLetzte;
+}
+
 /* Eckpunkte aus der Erkennung in Overlay-Koordinaten umrechnen */
 function nachOverlay(quad, info) {
   var sx = info.ew / info.w, sy = info.eh / info.h;
@@ -634,9 +702,29 @@ function schleife() {
       erkFolge++;
       erkAnfragen[erkFolge] = { ew: f.aus.ew, eh: f.aus.eh, w: f.breite, h: f.hoehe };
       erkOffen = true;
+
+      /* Derselbe Frame geht zusaetzlich an die KI - aber nur, wenn sie
+       * gerade frei ist. Dafuer braucht sie eine eigene Kopie, weil der
+       * Puffer an den Geometrie-Worker UEBERGEBEN (nicht kopiert) wird. */
+      var kiKopie = null;
+      if (kiWorker && kiBereit && !kiOffen && jetzt - kiLetzteSendung > KI_ABSTAND_MS) {
+        kiKopie = new Uint8ClampedArray(f.daten.data);
+      }
+
+      var hinweis = kiHinweis();
       var puffer = f.daten.data.buffer;
       erkWorker.postMessage({ typ: "live", rgba: puffer, breite: f.breite,
-                              hoehe: f.hoehe, folge: erkFolge }, [puffer]);
+                              hoehe: f.hoehe, folge: erkFolge,
+                              kiQuad: hinweis ? hinweis.quad : null,
+                              kiKonf: hinweis ? hinweis.konf : 0 }, [puffer]);
+
+      if (kiKopie) {
+        kiOffen = true;
+        kiLetzteSendung = jetzt;
+        kiWorker.postMessage({ typ: "live", rgba: kiKopie.buffer,
+                               breite: f.breite, hoehe: f.hoehe,
+                               folge: erkFolge }, [kiKopie.buffer]);
+      }
     }
   }
 
@@ -853,6 +941,42 @@ function blitzen() {
   setTimeout(function () { b.remove(); }, 440);
 }
 
+/* ========================== Scan-Stil =========================== */
+/* Drei Veredelungen, die scan_wrapper.py anbietet. "farbe" ist der
+ * Normalfall: Papier wird weiss, Text bleibt vollstaendig, Farben
+ * bleiben Farben. "grau" spart Platz, "sw" ist der klassische
+ * Kopierer-Look (Sauvola-Schwelle) fuer reine Textseiten. */
+var STILE = [
+  { id: "farbe", name: "Farbe" },
+  { id: "grau",  name: "Graustufen" },
+  { id: "sw",    name: "Schwarz-Wei\u00df" }
+];
+var stilIndex = 0;
+
+function stilLaden() {
+  try {
+    var g = localStorage.getItem("ultra-scan-stil");
+    for (var i = 0; i < STILE.length; i++) {
+      if (STILE[i].id === g) { stilIndex = i; }
+    }
+  } catch (e) { /* Privatmodus: dann eben Standard */ }
+  stilAnzeigen();
+}
+
+function stilAnzeigen() {
+  if (stilPille) { stilPille.textContent = STILE[stilIndex].name; }
+}
+
+function stilWeiter() {
+  stilIndex = (stilIndex + 1) % STILE.length;
+  stilAnzeigen();
+  try { localStorage.setItem("ultra-scan-stil", STILE[stilIndex].id); } catch (e) { /* egal */ }
+  toast(STILE[stilIndex].name);
+}
+
+if (stilPille) { stilPille.addEventListener("click", stilWeiter); }
+stilLaden();
+
 /* ========================== Scannen ============================= */
 function scanStarten(bilddaten, quadHinweis) {
   scanLaeuft = true;
@@ -863,7 +987,8 @@ function scanStarten(bilddaten, quadHinweis) {
   worker.postMessage({
     typ: "scan", rgba: puffer,
     breite: bilddaten.width, hoehe: bilddaten.height,
-    quad: quadHinweis || null
+    quad: quadHinweis || null,
+    veredelung: STILE[stilIndex].id
   }, [puffer]);
 }
 
@@ -872,7 +997,6 @@ function scanStarten(bilddaten, quadHinweis) {
  * auch auf mitgebrachten Fotos ein Dokument, wo die alte Pipeline
  * "Kein Dokument gefunden" gemeldet hat. */
 function scanMitVorerkennung(bilddaten) {
-  var kopie = new Uint8ClampedArray(bilddaten.data);  // Puffer wird uebertragen
   standbildMarke++;
   var marke = standbildMarke;
   var fertig = false;
@@ -881,12 +1005,51 @@ function scanMitVorerkennung(bilddaten) {
     fertig = true;
     scanStarten(bilddaten, quad || null);
   };
-  standbildWartet[marke] = function (quad) { los(quad); };
-  setTimeout(function () { los(null); }, 4000);        // Notbremse
-  erkWorker.postMessage({
-    typ: "standbild", marke: marke, rgba: kopie.buffer,
-    breite: bilddaten.width, hoehe: bilddaten.height
-  }, [kopie.buffer]);
+  setTimeout(function () { los(null); }, 9000);        // Notbremse
+
+  /* Schritt 2: Geometrie - mit dem KI-Viereck als Kandidat. */
+  var geometrie = function (kiQuad, kiKonf) {
+    if (fertig) { return; }
+    var kopie = new Uint8ClampedArray(bilddaten.data);  // Puffer wird uebertragen
+    standbildWartet[marke] = function (quad) { los(quad); };
+    setTimeout(function () {                            // zweite Notbremse
+      if (standbildWartet[marke]) {
+        delete standbildWartet[marke];
+        los(kiQuad || null);
+      }
+    }, 5000);
+    erkWorker.postMessage({
+      typ: "standbild", marke: marke, rgba: kopie.buffer,
+      breite: bilddaten.width, hoehe: bilddaten.height,
+      kiQuad: kiQuad || null, kiKonf: kiKonf || 0
+    }, [kopie.buffer]);
+  };
+
+  /* Schritt 1: KI befragen (wenn vorhanden). Sie darf hier gruendlich
+   * arbeiten - ein mitgebrachtes Foto ist kein Sucherbild, 300 ms mehr
+   * fallen nicht auf. */
+  if (kiWorker) {
+    var kiFertig = false;
+    kiStandbild[marke] = function (quad, konf) {
+      if (kiFertig) { return; }
+      kiFertig = true;
+      geometrie(quad, konf);
+    };
+    setTimeout(function () {
+      if (!kiFertig) {
+        kiFertig = true;
+        delete kiStandbild[marke];
+        geometrie(null, 0);
+      }
+    }, 3500);
+    var kiKopie = new Uint8ClampedArray(bilddaten.data);
+    kiWorker.postMessage({
+      typ: "standbild", marke: marke, rgba: kiKopie.buffer,
+      breite: bilddaten.width, hoehe: bilddaten.height
+    }, [kiKopie.buffer]);
+  } else {
+    geometrie(null, 0);
+  }
 }
 
 function scanFertig() {

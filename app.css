@@ -232,7 +232,30 @@ body::before {           /* ruhiges Farbleuchten im Hintergrund */
   gap: 16px;
   z-index: 10;
 }
-.leiste-mitte { flex: 1; display: flex; justify-content: center; }
+.leiste-mitte {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+/* Scan-Stil: Farbe / Graustufen / Schwarz-Weiss, tippen schaltet weiter. */
+.stil-pille {
+  padding: 7px 15px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--licht-weich);
+  background: rgba(10, 16, 32, 0.46);
+  -webkit-backdrop-filter: blur(20px) saturate(170%);
+  backdrop-filter: blur(20px) saturate(170%);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  transition: transform 0.16s ease, border-color 0.3s ease, color 0.3s ease;
+  cursor: pointer;
+}
+.stil-pille:active { transform: scale(0.93); }
 .auto-pille {
   padding: 9px 16px;
   border-radius: 999px;
@@ -553,6 +576,7 @@ button.rund.dreht { animation: umdrehen 0.6s cubic-bezier(0.22, 1, 0.36, 1); }
   button.rund { width: 72px; height: 72px; }
   button.rund svg { width: 31px; height: 31px; }
   .auto-pille { font-size: 15px; padding: 11px 22px; }
+  .stil-pille { font-size: 14px; padding: 9px 20px; }
   .kamera-hinweis { font-size: 17px; padding: 12px 26px; top: 26px; }
 
   /* iPad: Scans nebeneinander statt endlos untereinander */

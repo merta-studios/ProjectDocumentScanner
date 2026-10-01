@@ -956,6 +956,13 @@
    *   optionen.minFlaeche   : Mindestflaeche des Vierecks (0..1, Std 0.06)
    *   optionen.feinKante    : Aufloesung fuer das Nachziehen (Std 2x Arbeit)
    *   optionen.randErlaubt  : duerfen Bildraender Kanten sein (Std true)
+   *   optionen.kandidaten   : zusaetzliche Vierecke von aussen, z.B. aus der
+   *                           KI-Erkennung (detect-nn.js). Format je Eintrag:
+   *                           { quad: [[x,y]x4], konfidenz: 0..1 }. Sie
+   *                           laufen durch GENAU dieselbe Bewertung wie die
+   *                           selbst gefundenen Vierecke - es gewinnt also
+   *                           immer das Viereck, das das Bild am besten
+   *                           stuetzt, nicht pauschal "die KI".
    * Rueckgabe: { quad, konfidenz, wert, flaeche, randSeiten, quelle } | null
    */
   function erkenne(rgba, breite, hoehe, optionen) {
@@ -1084,7 +1091,26 @@
         var bw = bewerte(b, liste[n].q, rs);
         bw.q = liste[n].q;
         bw.randSeiten = rs;
-        bw.quelle = liste[n].flaechenQuelle ? "flaeche" : "linien";
+        bw.quelle = liste[n].kiQuelle ? "ki"
+                  : (liste[n].flaechenQuelle ? "flaeche" : "linien");
+        if (liste[n].kiQuelle) {
+          /* Das Netz sieht ein Dokument auch dort, wo gar keine Kante im
+           * Bild ist (weisses Blatt auf weissem Tisch, Schattenrand,
+           * Finger ueber der Ecke). Reine Kantenbewertung kann das
+           * naturgemaess nicht belohnen - deshalb bekommt ein
+           * KI-Vorschlag einen Bonus, der mit seiner eigenen Sicherheit
+           * waechst. Bei unsicherer KI (<0.4) ist der Bonus klein, das
+           * Bild entscheidet dann weiter allein. */
+          bw.kiKonf = liste[n].kiKonf;
+          /* Quadratisch, nicht linear: ein unsicheres Netz (z.B. weil das
+           * Dokument ueber alle vier Bildraender hinausragt und es die
+           * Ecken nur raet) bekommt dadurch sogar einen Abschlag statt
+           * eines Bonus und kann ein gut gestuetztes Viereck aus dem Bild
+           * nicht verdraengen. */
+          bw.wert *= 0.5 + 1.8 * liste[n].kiKonf * liste[n].kiKonf;
+          bw.konfidenz = Math.max(bw.konfidenz, 0.55 * liste[n].kiKonf +
+                                                0.45 * bw.konfidenz);
+        }
         bewertet.push(bw);
         if (modul.sammle) { diagnose.alle.push(bw); }
         if (!best || bw.wert > best.wert) { best = bw; }
@@ -1092,12 +1118,35 @@
     }
     bewerteAlle(roh);
 
+    /* ---- Vorschlaege von aussen (KI) in dieselbe Bewertung werfen ---- */
+    var kiListe = [];
+    var extern = optionen.kandidaten || [];
+    for (i = 0; i < extern.length; i++) {
+      var ek = extern[i];
+      var eq = ek && ek.quad ? ek.quad : ek;
+      if (!eq || eq.length !== 4) { continue; }
+      var ekonf = (ek && ek.konfidenz !== undefined) ? ek.konfidenz : 0.8;
+      var ska = [b.w / breite, b.h / hoehe];
+      var qk = [];
+      for (j = 0; j < 4; j++) {
+        qk.push([klemme(eq[j][0] * ska[0], -0.25 * b.w, 1.25 * b.w),
+                 klemme(eq[j][1] * ska[1], -0.25 * b.h, 1.25 * b.h)]);
+      }
+      qk = sortiereEcken(qk, b.w / 2, b.h / 2);
+      if (!konvex(qk)) { continue; }
+      if (flaeche(qk) < minFlaeche * b.w * b.h * 0.6) { continue; }
+      kiListe.push({ q: qk, kiQuelle: true, kiKonf: klemme(ekonf, 0, 1) });
+    }
+    if (kiListe.length) { bewerteAlle(kiListe); }
+
     /* Helligkeits-Fallback nur, wenn die Linien nichts Ueberzeugendes
      * geliefert haben: er kostet mit Abstand die meiste Rechenzeit und
      * wird im Normalfall gar nicht gebraucht. */
     var flAnzahl = 0;
-    if (!best || best.konfidenz < 0.95 || best.flaeche < 0.2 ||
-        best.randSeiten.filter(Boolean).length) {
+    var kiSicher = best && best.quelle === "ki" && best.kiKonf > 0.85;
+    if (!kiSicher &&
+        (!best || best.konfidenz < 0.95 || best.flaeche < 0.2 ||
+         best.randSeiten.filter(Boolean).length)) {
       var flk = flaechenKandidaten(b), fliste = [];
       for (i = 0; i < flk.length; i++) {
         var qf = sortiereEcken(flk[i], b.w / 2, b.h / 2);
@@ -1129,8 +1178,20 @@
       best = aussenGewinnt(bewertet, best);
     }
 
-    /* Mindestanforderungen - sonst lieber "nichts gefunden" melden */
-    if (best.geo < 3.0 || best.abdeckung < 0.38) { diagnose.abgelehnt = true; return null; }
+    /* Mindestanforderungen - sonst lieber "nichts gefunden" melden.
+     *
+     * Ausnahme fuer die KI: ihre Aussage haengt NICHT an sichtbaren
+     * Kanten. Ein helles Blatt auf hellem Tisch hat kaum Kantenstuetze
+     * (geo klein), ist aber trotzdem ein Dokument. Deshalb genuegt bei
+     * einem sicheren KI-Viereck eine deutlich kleinere Huerde - sonst
+     * meldet die App weiter "kein Dokument", obwohl sie es gesehen hat. */
+    var kiTraegt = best.quelle === "ki" && best.kiKonf >= 0.52;
+    if (kiTraegt) {
+      /* KI-Viereck: eigene, niedrigere Huerde (siehe oben). */
+      if (best.flaeche < 0.03) { diagnose.abgelehnt = true; return null; }
+    } else if (best.geo < 3.0 || best.abdeckung < 0.38) {
+      diagnose.abgelehnt = true; return null;
+    }
 
     /* Nachziehen: moeglichst in hoeherer Aufloesung */
     var quad = best.q;
@@ -1141,7 +1202,11 @@
       faktorX = fein.w / b.w; faktorY = fein.h / b.h;
       quad = quad.map(function (p) { return [p[0] * faktorX, p[1] * faktorY]; });
     }
-    var such = Math.max(4, 0.022 * fein.diag);
+    /* Nachziehen: bei einem KI-Viereck kleiner suchen. Die Ecken sitzen
+     * dann schon fast richtig; ein weiter Suchkorridor wuerde nur das
+     * Risiko erhoehen, auf eine Textzeile oder einen Schattenrand
+     * danebenzuspringen. */
+    var such = Math.max(4, (kiTraegt ? 0.012 : 0.022) * fein.diag);
     quad = verfeinere(fein, quad, such);
     quad = verfeinere(fein, quad, Math.max(3, such * 0.45));
 
@@ -1174,7 +1239,7 @@
       houghLinien: houghLinien, verfeinere: verfeinere,
       bewerte: bewerte, sortiereEcken: sortiereEcken, flaeche: flaeche
     },
-    version: 2
+    version: 3
   };
   global.UltraErkennung = modul;
 
