@@ -97,10 +97,30 @@ body::before {           /* ruhiges Farbleuchten im Hintergrund */
 }
 .topbar-status {
   margin-left: auto;
-  font-size: 13px;
+  -webkit-appearance: none;
+  appearance: none;
+  padding: 7px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.09);
   color: var(--licht-weich);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 570;
   font-variant-numeric: tabular-nums;
+  line-height: 1;
+  cursor: pointer;
+  transition: transform 0.16s ease, color 0.2s ease, background 0.2s ease, border-color 0.2s ease;
 }
+.topbar-status:not(.verborgen) { display: inline-flex; align-items: center; justify-content: center; }
+.topbar-status:hover,
+.topbar-status:focus-visible {
+  color: #fff;
+  border-color: rgba(25, 232, 255, 0.48);
+  background: rgba(58, 160, 255, 0.16);
+  outline: none;
+}
+.topbar-status:active { transform: scale(0.96); }
 
 /* ------------------------------ Buehnen ----------------------------- */
 .buehne {
@@ -297,19 +317,27 @@ button.rund.dreht { animation: umdrehen 0.6s cubic-bezier(0.22, 1, 0.36, 1); }
 }
 @keyframes schweben { to { transform: translateY(-8px) scale(1.02); } }
 
+.lade-prozent {
+  margin-top: 10px;
+  color: rgba(234, 242, 255, 0.78);
+  font-size: 13px;
+  font-weight: 620;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.2px;
+}
 .balken-rahmen {
-  margin-top: 20px;
+  margin-top: 10px;
   height: 8px;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.13);
   overflow: hidden;
 }
 .balken {
-  height: 100%; width: 2%;
+  height: 100%; width: 0%;
   border-radius: 999px;
   background: linear-gradient(90deg, var(--akzent), var(--akzent-2));
   box-shadow: 0 0 18px var(--akzent-glut);
-  transition: width 0.4s cubic-bezier(0.22, 1, 0.36, 1);
+  transition: none;
 }
 
 /* Arbeits-Animation */
@@ -439,18 +467,24 @@ button.rund.dreht { animation: umdrehen 0.6s cubic-bezier(0.22, 1, 0.36, 1); }
   to { opacity: 0; transform: scale(0.9) translateY(10px); }
 }
 .scan-bild-rahmen {
+  position: relative;
   border-radius: 16px;
   overflow: hidden;
   background: rgba(0, 0, 0, 0.35);
-  display: grid;
-  place-items: center;
   min-height: 160px;
 }
 .scan-bild-rahmen img {
+  position: absolute;
+  left: 50%; top: 50%;
   display: block;
-  max-width: 100%;
-  max-height: 58vh;
-  transition: transform 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+  max-width: none;
+  max-height: none;
+  transform-origin: center center;
+  will-change: transform;
+  transition:
+    transform 0.45s cubic-bezier(0.22, 1, 0.36, 1),
+    width 0.22s ease,
+    height 0.22s ease;
 }
 .scan-kopf {
   display: flex;
