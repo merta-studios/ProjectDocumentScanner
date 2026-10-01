@@ -28,3 +28,26 @@
   [headers.values]
     Content-Type = "text/x-python; charset=utf-8"
     Cache-Control = "no-cache"
+
+# Das KI-Modell (DocAligner, Apache-2.0) ist versioniert -> ewig cachen
+[[headers]]
+  for = "/models/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+# WebAssembly und ES-Module der ONNX-Laufzeit brauchen den richtigen Typ,
+# sonst verweigert der Browser das Streaming bzw. den Modul-Import.
+[[headers]]
+  for = "/vendor/onnxruntime-web-1.20.1/*.wasm"
+  [headers.values]
+    Content-Type = "application/wasm"
+
+[[headers]]
+  for = "/vendor/onnxruntime-web-1.20.1/*.mjs"
+  [headers.values]
+    Content-Type = "text/javascript; charset=utf-8"
+
+[[headers]]
+  for = "/models/*.onnx"
+  [headers.values]
+    Content-Type = "application/octet-stream"

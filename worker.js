@@ -137,16 +137,20 @@ function scannen(n) {
    * Kanten im grossen Bild nach - das Ergebnis sitzt dadurch genau dort,
    * wo im Sucher der Rahmen stand. */
   pyodide.globals.set("quad_js", n.quad ? JSON.stringify(n.quad) : null);
+  /* Scan-Stil aus der Oberflaeche: farbe | grau | sw (| original | roh). */
+  pyodide.globals.set("stil_js", n.veredelung || "farbe");
   var proxy = pyodide.runPython(
     "import json, scan_wrapper\n" +
     "_q = json.loads(quad_js) if quad_js else None\n" +
-    "_out, _h, _w, _info = scan_wrapper.scan_rgba_streng(rgba_js.to_py(), hoehe_js, breite_js, _q)\n" +
+    "_out, _h, _w, _info = scan_wrapper.scan_rgba_streng(rgba_js.to_py(), hoehe_js, breite_js, _q,\n" +
+    "                                                    veredelung=stil_js)\n" +
     "(_out, _h, _w, json.dumps(_info))\n"
   );
   var ergebnis = proxy.toJs();
   proxy.destroy();
   pyodide.globals.delete("rgba_js");
   pyodide.globals.delete("quad_js");
+  pyodide.globals.delete("stil_js");
   var info = JSON.parse(ergebnis[3]);
   if (!info.dokument_erkannt || !ergebnis[0]) {
     postMessage({ typ: "keindokument" });

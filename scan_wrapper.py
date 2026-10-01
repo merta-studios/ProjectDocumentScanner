@@ -264,9 +264,284 @@ def scheren(warped):
 
 
 # ===========================================================================
+# Veredelung: aus dem entzerrten Foto ein sauberes Scan-Bild machen
+# ===========================================================================
+#
+# WARUM NEU?
+# ----------
+# Die Original-Veredelung (scanner.mode_bw_smart + scanner.mode_hybrid) baut
+# das Ergebnis aus einer HARTEN Schwarz-Weiss-Maske zusammen: alles, was der
+# adaptive Schwellwert nicht als Tinte erkennt, wird reinweiss uebermalt.
+# Das erzeugt genau die Fehler, die an den Scans gestoert haben:
+#
+#   * Loecher in Buchstaben und abgerissene duenne Striche,
+#   * helle Hoefe (Halos) um jeden Buchstaben,
+#   * Bleistift, Raster, graue Flaechen und Fotos verschwinden ganz,
+#   * doppelte Aufloesung (2x Supersampling) ohne echten Mehrwert.
+#
+# Die neue Veredelung arbeitet stattdessen so, wie es gaengige Scanner-Apps
+# und die Literatur zur Dokumentbildverbesserung machen - in Halbtoenen,
+# ohne harte Maske:
+#
+#   1. BELEUCHTUNGSFELD schaetzen und herausrechnen ("flat field").
+#      Grundlage: morphologisches Schliessen (schluckt die Tinte) und eine
+#      sehr breite Weichzeichnung (laesst nur den Licht-Verlauf uebrig).
+#      Die Korrektur wird begrenzt, damit grosse farbige Flaechen nicht
+#      ausgebleicht werden - genau dieser Fehler liess Diagramme und
+#      Marker-Flaechen im alten Weg verschwinden.
+#   2. WEISS- UND SCHWARZPUNKT aus dem Histogramm setzen (Tonwertspreizung)
+#      mit sanfter Kurve statt hartem Clipping.
+#   3. LOKALER KONTRAST (CLAHE) sehr dezent, damit blasse Bleistiftschrift
+#      lesbar wird, ohne Rauschen hochzuziehen.
+#   4. SCHAERFEN mit kleinem Radius und Schwelle (Unschaerfemaske). Kleiner
+#      Radius = keine Halos.
+#
+# Fuer Schwarz-Weiss gibt es den Sauvola-Schwellwert (Sauvola & Pietikaeinen
+# 2000) - der Standard der Dokumentbinarisierung, deutlich robuster als ein
+# globaler oder gleitender Mittelwert, und hier ueber Integralbilder
+# berechnet, also schnell genug fuer den Browser.
+
+
+def _ungerade(n, mindest=3):
+    n = int(round(n))
+    if n < mindest:
+        n = mindest
+    return n | 1
+
+
+def beleuchtungsfeld(gray):
+    """Schaetzt, wie hell das Papier OHNE Tinte an jeder Stelle waere.
+
+    Gerechnet wird auf einem kleinen Bild: das ist nicht nur schneller,
+    sondern auch glatter (kein Nachziehen einzelner Buchstaben).
+    """
+    h, w = gray.shape[:2]
+    lang = max(h, w)
+    f = 480.0 / lang
+    if f < 1.0:
+        klein = cv2.resize(gray, (max(8, int(w * f)), max(8, int(h * f))),
+                           interpolation=cv2.INTER_AREA)
+    else:
+        klein = gray.copy()
+    kh, kw = klein.shape[:2]
+    # Kernel so gross, dass eine Textzeile komplett darunter passt
+    k = _ungerade(max(kh, kw) * 0.055, 5)
+    kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    feld = cv2.morphologyEx(klein, cv2.MORPH_CLOSE, kern)
+    feld = cv2.medianBlur(feld, _ungerade(min(k, 31), 3))
+    # Glaetten, ABER die Schattenkante stehen lassen.
+    #
+    # Ein Gauss waere hier falsch: Ein harter Schlagschatten (Hand, Regal,
+    # Fensterkreuz) hat eine SCHARFE Kante. Verschmiert man die im
+    # Lichtfeld, bleibt genau an dieser Kante ein dunkler Keil im Scan
+    # stehen - der Fehler, der frueher als "Schatten bleibt drin" auffiel.
+    # Der Bilateralfilter mittelt nur zwischen aehnlich hellen Nachbarn
+    # und laesst die Stufe deshalb scharf.
+    # d=9 statt "aus der Sigma berechnen": gleiches Ergebnis, halbe Zeit.
+    feld = cv2.bilateralFilter(feld, 9, 18, max(3.0, 0.05 * max(kh, kw)))
+    # Reste glaetten, aber nur ganz leicht (sonst ist die Kante wieder weg).
+    feld = cv2.GaussianBlur(feld, (0, 0), max(1.0, 0.010 * max(kh, kw)))
+    return cv2.resize(feld, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def beleuchtung_ausgleichen(bgr, grenze=3.2, dunkler=2.4):
+    """Schatten, Vignette und schraeges Licht herausrechnen.
+
+    WICHTIG: EIN gemeinsamer Verstaerkungsfaktor fuer alle drei Kanaele.
+    Je Kanal zu normalisieren wuerde farbiges Papier grau machen und
+    farbige Flaechen ausbleichen. Der Faktor wird zusaetzlich begrenzt,
+    damit eine grosse dunkle Flaeche (Foto, Balkendiagramm) nicht als
+    "Schatten" missverstanden und weiss gerechnet wird.
+    """
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    feld = beleuchtungsfeld(gray).astype(np.float32)
+    ziel = float(np.percentile(feld, 92))
+    if ziel < 1.0:
+        return bgr.copy()
+    gewinn = ziel / np.maximum(feld, 1.0)
+    # Aufhellen darf mehr als Abdunkeln: Schatten sollen weg, aber eine
+    # grosse helle Flaeche soll nicht kuenstlich dunkel werden.
+    gewinn = np.clip(gewinn, 1.0 / dunkler, grenze)
+    out = bgr.astype(np.float32) * gewinn[..., None]
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _weisspunkt(bgr, abweichung=0.22):
+    """Weisspunkt JE KANAL aus der Papierflaeche - das ist der Weissabgleich.
+
+    Ohne diesen Schritt bleibt Papier so getoent, wie die Kamera es
+    gesehen hat: unter Gluehlicht gelb, im Schatten blau. Genau das
+    liess frueher bearbeitete Fotos "schmuddelig" aussehen.
+
+    Gemessen wird nur auf der hellen Haelfte des Bildes (das IST das
+    Papier) und die drei Kanaele duerfen nur begrenzt auseinanderlaufen -
+    sonst wuerde ein tatsaechlich farbiges Blatt (gelber Notizzettel)
+    gewaltsam entfaerbt.
+    """
+    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    schwelle = float(np.percentile(g, 65.0))
+    papier = g >= schwelle
+    if papier.sum() < 50:
+        papier = np.ones_like(g, dtype=bool)
+    weiss = []
+    for c in range(3):
+        werte = bgr[:, :, c][papier]
+        weiss.append(float(np.percentile(werte, 82.0)))
+    mittel = max(sum(weiss) / 3.0, 1.0)
+    unten, oben = mittel * (1.0 - abweichung), mittel * (1.0 + abweichung)
+    weiss = [min(max(w, unten), oben) for w in weiss]
+    weiss = [max(w, 50.0) for w in weiss]
+    return weiss, mittel
+
+
+def tonwert_spreizen(bgr, staerke=1.0):
+    """Weissabgleich + Tonwertspreizung mit weicher Schulter."""
+    weiss, mittel = _weisspunkt(bgr)
+    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    schwarz = float(np.percentile(g, 0.4))
+    schwarz = min(schwarz, mittel - 60.0)
+    schwarz = max(schwarz, 0.0)
+
+    x = bgr.astype(np.float32)
+    for c in range(3):
+        x[:, :, c] = (x[:, :, c] - schwarz) * (255.0 / max(weiss[c] - schwarz, 1.0))
+    # weiche Schulter oben: alles ueber 228 wird sanft nach 255 gezogen,
+    # statt abgeschnitten zu werden. Das haelt Papier sauber weiss, ohne
+    # hellen Inhalt (gelber Marker, Raster) zu verschlucken.
+    hoch = np.clip((x - 228.0) / 32.0, 0.0, 1.0)
+    x = x * (1.0 - hoch) + (228.0 + 27.0 * np.sqrt(hoch)) * hoch
+    if staerke != 1.0:
+        x = bgr.astype(np.float32) * (1.0 - staerke) + x * staerke
+    return np.clip(x, 0, 255).astype(np.uint8)
+
+
+def farbrauschen_daempfen(bgr):
+    """Farbrauschen glaetten, Schaerfe behalten.
+
+    Handykameras rauschen vor allem in der FARBE. Auf einer leeren
+    Papierflaeche sieht man das als buntes Gewimmel, das jede folgende
+    Kontrastanhebung noch verstaerkt. Deshalb werden in LAB nur die
+    beiden Farbkanaele geglaettet - die Helligkeit (und damit jeder
+    Buchstabe) bleibt unangetastet.
+    """
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    a = cv2.medianBlur(a, 5)
+    b = cv2.medianBlur(b, 5)
+    return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+
+def hintergrund_weissen(bgr, start=197.0, ende=242.0):
+    """Papier wirklich weiss machen - aber weich und inhaltssicher.
+
+    Die Original-Pipeline hat dafuer eine harte Tintenmaske benutzt und
+    alles andere reinweiss uebermalt; dabei gingen duenne Striche,
+    Bleistift und Raster verloren. Hier wird stattdessen nur das
+    ueberblendet, was ohnehin schon fast weiss UND farblos ist:
+
+      * weicher Uebergang (Smoothstep) statt Schwelle -> keine Kanten,
+      * Buntes bleibt verschont -> Marker, Stempel, Logos ueberleben,
+      * alles unter ~204 bleibt vollstaendig erhalten -> Bleistift bleibt.
+    """
+    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    chroma = (bgr.max(axis=2).astype(np.int16) -
+              bgr.min(axis=2).astype(np.int16)).astype(np.float32)
+    t = np.clip((g - start) / max(ende - start, 1.0), 0.0, 1.0)
+    t = t * t * (3.0 - 2.0 * t)                     # Smoothstep
+    t *= np.clip(1.0 - (chroma - 26.0) / 40.0, 0.0, 1.0)
+    t = t[..., None]
+    out = bgr.astype(np.float32) * (1.0 - t) + 255.0 * t
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def lokaler_kontrast(bgr, clip=1.6):
+    """Sehr dezentes CLAHE auf der Helligkeit (LAB), Farbe bleibt unberuehrt."""
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    h, w = l.shape[:2]
+    kacheln = (max(2, min(12, w // 180)), max(2, min(12, h // 180)))
+    l = cv2.createCLAHE(clipLimit=clip, tileGridSize=kacheln).apply(l)
+    return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+
+def schaerfen(bgr, staerke=0.6, radius=1.0, schwelle=4):
+    """Unschaerfemaske mit kleinem Radius und Schwelle.
+
+    Kleiner Radius -> keine hellen Hoefe um Buchstaben. Die Schwelle
+    verhindert, dass Papierrauschen mitverstaerkt wird.
+    """
+    weich = cv2.GaussianBlur(bgr, (0, 0), radius)
+    diff = bgr.astype(np.float32) - weich.astype(np.float32)
+    maske = (np.abs(diff).max(axis=2) > schwelle).astype(np.float32)[..., None]
+    out = bgr.astype(np.float32) + staerke * diff * maske
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def sauvola(gray, fenster=None, k=0.22, R=128.0):
+    """Sauvola-Schwellwert ueber Integralbilder.
+
+    T(x,y) = m(x,y) * (1 + k * (s(x,y)/R - 1))
+    Sauvola & Pietikaeinen, "Adaptive document image binarization",
+    Pattern Recognition 33 (2000). Standardverfahren der
+    Dokumentbinarisierung - haelt duenne Striche, ohne in leeren Flaechen
+    Flecken zu erzeugen (das Problem des gleitenden Mittelwerts).
+    """
+    h, w = gray.shape[:2]
+    if fenster is None:
+        fenster = _ungerade(max(h, w) * 0.035, 15)
+    r = fenster // 2
+    g = gray.astype(np.float64)
+    summe, quadrat = cv2.integral2(g)
+    y0 = np.clip(np.arange(h) - r, 0, h)
+    y1 = np.clip(np.arange(h) + r + 1, 0, h)
+    x0 = np.clip(np.arange(w) - r, 0, w)
+    x1 = np.clip(np.arange(w) + r + 1, 0, w)
+    flaeche = ((y1 - y0)[:, None] * (x1 - x0)[None, :]).astype(np.float64)
+
+    def kasten(iib):
+        return (iib[y1[:, None], x1[None, :]] - iib[y0[:, None], x1[None, :]]
+                - iib[y1[:, None], x0[None, :]] + iib[y0[:, None], x0[None, :]])
+
+    m = kasten(summe) / flaeche
+    varianz = np.maximum(kasten(quadrat) / flaeche - m * m, 0.0)
+    s = np.sqrt(varianz)
+    T = m * (1.0 + k * (s / R - 1.0))
+    return (g > T).astype(np.uint8) * 255
+
+
+def veredeln(bgr, modus="farbe"):
+    """Die neue Veredelung. modus: "farbe" | "grau" | "sw" | "roh"."""
+    if modus == "roh":
+        return bgr
+
+    flach = beleuchtung_ausgleichen(bgr)          # 1. Licht ausgleichen
+    flach = farbrauschen_daempfen(flach)          # 2. Farbrauschen weg
+    flach = tonwert_spreizen(flach)               # 3. Weissabgleich + Tonwerte
+
+    if modus == "sw":
+        g = cv2.cvtColor(flach, cv2.COLOR_BGR2GRAY)
+        g = cv2.bilateralFilter(g, 5, 35, 5)      # Flaechen glaetten, Striche schonen
+        bw = sauvola(g)
+        return cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
+
+    flach = lokaler_kontrast(flach, clip=1.3)     # 4. feiner Nahkontrast
+    flach = hintergrund_weissen(flach)            # 5. Papier wird Papierweiss
+    flach = schaerfen(flach)                      # 6. knackig, ohne Halos
+
+    if modus == "grau":
+        g = cv2.cvtColor(flach, cv2.COLOR_BGR2GRAY)
+        return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+
+    # Farbe: Saettigung ganz leicht anheben (Marker, Stempel, Logos)
+    hsv = cv2.cvtColor(flach, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv[..., 1] = np.clip(hsv[..., 1] * 1.12, 0, 255)
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+
+# ===========================================================================
 # Hauptlauf
 # ===========================================================================
-def scan_bgr(src, hinweis=None, streng=False):
+def scan_bgr(src, hinweis=None, streng=False, veredelung="farbe"):
     """Kompletter Hauptlauf der Original-Pipeline auf einem BGR-Bild.
 
     Rueckgabe: (hybrid_bgr, info_dict). info_dict enthaelt
@@ -362,19 +637,27 @@ def scan_bgr(src, hinweis=None, streng=False):
         else:
             meldungen.append("Scherung verworfen (haette den Text verzerrt).")
 
-    bw = scanner.mode_bw_smart(warped, book=(gx_ >= 0))
-    clean0 = scanner.auto_clean(warped)
-    hybrid = scanner.mode_hybrid(clean0, bw, scale=2, orig=warped)
+    # ---- Veredelung
+    # Standard ist die neue Halbton-Veredelung (siehe oben). Die
+    # Original-Variante bleibt ueber veredelung="original" erreichbar -
+    # die Datei "scanner" wird dadurch weiterhin nicht angefasst.
+    info["veredelung"] = veredelung
+    if veredelung == "original":
+        bw = scanner.mode_bw_smart(warped, book=(gx_ >= 0))
+        clean0 = scanner.auto_clean(warped)
+        ergebnis = scanner.mode_hybrid(clean0, bw, scale=2, orig=warped)
+    else:
+        ergebnis = veredeln(warped, modus=veredelung)
 
-    return hybrid, info
+    return ergebnis, info
 
 
-def scan_rgba(rgba_flat, hoehe, breite, quad=None):
+def scan_rgba(rgba_flat, hoehe, breite, quad=None, veredelung="farbe"):
     """Einstiegspunkt fuer die Web-App (Pyodide)."""
     arr = np.frombuffer(bytes(rgba_flat), dtype=np.uint8)
     arr = arr.reshape((int(hoehe), int(breite), 4))
     bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
-    hybrid, info = scan_bgr(bgr, quad)
+    hybrid, info = scan_bgr(bgr, quad, veredelung=veredelung)
     out = cv2.cvtColor(hybrid, cv2.COLOR_BGR2RGBA)
     h, w = out.shape[:2]
     return out.tobytes(), h, w, info
@@ -400,7 +683,7 @@ def quad_aus_rgba(rgba_flat, hoehe, breite):
     return [[float(p[0]), float(p[1])] for p in pts]
 
 
-def scan_rgba_streng(rgba_flat, hoehe, breite, quad=None):
+def scan_rgba_streng(rgba_flat, hoehe, breite, quad=None, veredelung="farbe"):
     """Wie scan_rgba(), bricht aber ab, wenn kein Dokument erkannt wurde.
 
     Mit mitgegebenem Viereck (Live-Erkennung) gilt das Dokument als
@@ -411,7 +694,7 @@ def scan_rgba_streng(rgba_flat, hoehe, breite, quad=None):
     arr = np.frombuffer(bytes(rgba_flat), dtype=np.uint8)
     arr = arr.reshape((int(hoehe), int(breite), 4))
     bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
-    hybrid, info = scan_bgr(bgr, quad, streng=True)
+    hybrid, info = scan_bgr(bgr, quad, streng=True, veredelung=veredelung)
     if hybrid is None:
         return None, 0, 0, info
     out = cv2.cvtColor(hybrid, cv2.COLOR_BGR2RGBA)
