@@ -146,13 +146,15 @@ def _geometrie_stufe(img, name, quad=None):
 def viereck_bestimmen(src, hinweis=None):
     h, w = src.shape[:2]
     if hinweis is not None and _quad_plausibel(hinweis, h, w):
-        grob = _ordne_robust(hinweis)
-        fein = scanner.refine_edges(src, grob)
-        if fein is not None and _quad_plausibel(fein, h, w):
-            weg = np.linalg.norm(_ordne_robust(fein) - grob, axis=1).max()
-            if weg < 0.07 * float(np.hypot(w, h)):
-                return _ordne_robust(fein), "hinweis+refine"
-        return grob, "hinweis"
+        # Der Hinweis kommt im echten App-Pfad bereits aus detect.js:
+        # dort werden Kandidaten bewertet und auf hochaufgeloesten Kanten
+        # verfeinert. Ein zweites, unbeschraenktes scanner.refine_edges()
+        # kann auf Text-, Tisch- oder Schattenkanten springen und damit ein
+        # zuvor richtiges Quad verschlechtern. Deshalb hier nur normieren,
+        # plausibilisieren und einmal warpen; die Python-Suche bleibt der
+        # Fallback fuer Aufrufe ohne Hinweis.
+        return _ordne_robust(hinweis), "hinweis_js"
+
     grob = scanner.find_rough_quad(src)
     if grob is None:
         return None, "nichts"
