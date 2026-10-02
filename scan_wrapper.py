@@ -521,6 +521,12 @@ def _linienGeradheit(img, kante=700):
     except Exception:
         return 0.0
 
+def _geradheit_erhalten(vor, nach):
+    """Verwirft affine Korrekturen nur bei klar messbarer Linien-Verschlechterung."""
+    vor = float(vor)
+    nach = float(nach)
+    return nach <= max(vor * 1.15, vor + 0.5)
+
 def _uvdoc_lohnt(src, hinweis, gitter):
     klein = _klein(src, 900)
     f = klein.shape[1] / float(src.shape[1])
@@ -678,23 +684,24 @@ def scan_bgr(src, hinweis=None, streng=False, veredelung="farbe", uvdoc=None):
         meldungen.append(grund)
 
     vor = zeilen_guete(warped)
+    gerad_dreh_vor = _linienGeradheit(warped, kante=700)
     kandidat, winkel, gemacht = drehen(warped)
     if gemacht:
-        if ist_tab:
-            gerad_kand = _linienGeradheit(kandidat, kante=700)
-            if gerad_kand > gerad_vor * 1.4 and gerad_vor > 0.3:
-                meldungen.append(f"Drehung verworfen (Tabelle waere schiefer: {gerad_vor:.2f} -> {gerad_kand:.2f}px).")
-            elif zeilen_guete(kandidat) >= vor * 0.98:
-                warped = kandidat
-                meldungen.append(f"Blatt um {winkel:+.1f} Grad gerade gedreht.")
-            else:
-                meldungen.append("Drehung verworfen (haette den Text schiefer gemacht).")
+        gerad_dreh_nach = _linienGeradheit(kandidat, kante=700)
+        gerad_ok = _geradheit_erhalten(gerad_dreh_vor, gerad_dreh_nach)
+        guete_nach = zeilen_guete(kandidat)
+        if not gerad_ok:
+            meldungen.append(f"Drehung verworfen (Linien waeren welliger: {gerad_dreh_vor:.2f} -> {gerad_dreh_nach:.2f}px).")
+        elif abs(winkel) >= 0.3:
+            # deskew_by_text liefert einen robusten Winkel; ein schwacher
+            # Projektionsscore darf die Korrektur bei wenig Text nicht blockieren.
+            warped = kandidat
+            meldungen.append(f"Blatt um {winkel:+.1f} Grad gerade gedreht.")
+        elif guete_nach >= vor * (0.98 if ist_tab else 0.99):
+            warped = kandidat
+            meldungen.append(f"Blatt um {winkel:+.1f} Grad gerade gedreht.")
         else:
-            if zeilen_guete(kandidat) >= vor * 0.99:
-                warped = kandidat
-                meldungen.append(f"Blatt um {winkel:+.1f} Grad gerade gedreht.")
-            else:
-                meldungen.append("Drehung verworfen (haette den Text schiefer gemacht).")
+            meldungen.append("Drehung verworfen (keine ausreichende Verbesserung).")
 
     vor = zeilen_guete(warped)
     gerad_aktuell = _linienGeradheit(warped, kante=700) if ist_tab else 0.0
@@ -735,23 +742,19 @@ def scan_bgr(src, hinweis=None, streng=False, veredelung="farbe", uvdoc=None):
                 meldungen.append(f"Linker Leerrand um {lcut}px gekuerzt.")
 
     vor = zeilen_guete(warped)
+    gerad_scher_vor = _linienGeradheit(warped, kante=700)
     kandidat, scherung, gemacht = scheren(warped)
     if gemacht:
-        if ist_tab:
-            gerad_kand = _linienGeradheit(kandidat, kante=700)
-            if gerad_kand > gerad_aktuell * 1.4 and gerad_aktuell > 0.3:
-                meldungen.append("Scherung verworfen (Tabelle verzerrt).")
-            elif zeilen_guete(kandidat) >= vor * 1.01:
-                warped = kandidat
-                meldungen.append(f"Scherung {scherung:+.4f} ausgeglichen.")
-            else:
-                meldungen.append("Scherung verworfen (haette den Text verzerrt).")
+        gerad_scher_nach = _linienGeradheit(kandidat, kante=700)
+        guete_nach = zeilen_guete(kandidat)
+        if not _geradheit_erhalten(gerad_scher_vor, gerad_scher_nach):
+            meldungen.append("Scherung verworfen (Linien waeren welliger).")
+        elif abs(scherung) > 0.002 or guete_nach >= vor * 1.01:
+            # shear_level_lines verwirft bereits instabile Zeilenneigungen.
+            warped = kandidat
+            meldungen.append(f"Scherung {scherung:+.4f} ausgeglichen.")
         else:
-            if zeilen_guete(kandidat) >= vor * 1.01:
-                warped = kandidat
-                meldungen.append(f"Scherung {scherung:+.4f} ausgeglichen.")
-            else:
-                meldungen.append("Scherung verworfen (haette den Text verzerrt).")
+            meldungen.append("Scherung verworfen (keine ausreichende Verbesserung).")
 
     info["veredelung"] = veredelung
     buch_seite = (gx_ >= 0)
