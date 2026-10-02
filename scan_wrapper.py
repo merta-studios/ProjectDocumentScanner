@@ -178,11 +178,12 @@ def _warp_robust(img, quad):
 def entzerren(src, quad):
     if quad is None:
         return src.copy()
-    eigen = _ordne_robust(quad)
-    original = scanner.order_pts(np.asarray(quad, dtype=np.float64))
-    if np.allclose(np.asarray(original, dtype=np.float64), eigen, atol=1.0):
-        return scanner.warp(src, np.asarray(quad, dtype=np.float64))
-    return _warp_robust(src, quad)
+    # Im Vollscan darf die Eckreihenfolge nicht zwischen scanner.order_pts
+    # und _ordne_robust wechseln. Gerade stark gedrehte oder perspektivische
+    # Quads können mit sum/diff falsch zugeordnet werden; dann werden obere
+    # und untere Kante vertauscht oder der Warp zieht Inhalt schief.
+    # Der Wrapper verwendet deshalb immer dieselbe robuste Reihenfolge.
+    return _warp_robust(src, _ordne_robust(quad))
 
 def _affin_gross(img, A, grenze=1.35):
     Hh, Ww = img.shape[:2]
