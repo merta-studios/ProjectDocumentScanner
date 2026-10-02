@@ -777,6 +777,7 @@
   function verfeinereSeite(b, a, c, suchweite, polaritaet, mitte) {
     var L = Math.hypot(c[0] - a[0], c[1] - a[1]);
     if (L < 10) { return null; }
+    var minSignal = b.kontrastStd < 14 ? 1.0 : 2.0;
     var dx = (c[0] - a[0]) / L, dy = (c[1] - a[1]) / L;
     var nx = -dy, ny = dx;
     if (mitte) {
@@ -796,7 +797,7 @@
         v *= 1 - 0.25 * Math.abs(s) / (suchweite + 1e-6);
         if (v > bestV) { bestV = v; bestS = s; }
       }
-      if (bestS !== null && bestV > 2) {
+      if (bestS !== null && bestV > minSignal) {
         punkte.push([px + bestS * nx, py + bestS * ny]);
       }
     }
@@ -1586,7 +1587,8 @@
       faktorX = fein.w / b.w; faktorY = fein.h / b.h;
       quad = quad.map(function (p) { return [p[0] * faktorX, p[1] * faktorY]; });
     }
-    var such = Math.max(4, (kiTraegt ? 0.012 : 0.022) * fein.diag);
+    // Breite erste Nachsuche erreicht auch ungenaue KI-Quads; danach wird enger verfeinert.
+    var such = Math.max(4, 0.035 * fein.diag);
     quad = verfeinere(fein, quad, such);
     quad = verfeinere(fein, quad, Math.max(3, such * 0.45));
 
