@@ -703,6 +703,7 @@ def scan_bgr(src, hinweis=None, streng=False, veredelung="farbe", uvdoc=None):
     if sum(bars):
         if kandidat.size and kandidat.shape[0] * kandidat.shape[1] > 0.45 * vorher_area:
             warped = kandidat
+            stufen.append(_geometrie_stufe(warped, "nach_balken_crop"))
             meldungen.append("Schwarze Balken erkannt und entfernt.")
         else:
             meldungen.append("Balken-Schnitt verworfen (haette zu viel abgeschnitten).")
@@ -791,6 +792,7 @@ def scan_bgr(src, hinweis=None, streng=False, veredelung="farbe", uvdoc=None):
         elif abs(scherung) > 0.002 or guete_nach >= vor * 1.01:
             # shear_level_lines verwirft bereits instabile Zeilenneigungen.
             warped = kandidat
+            stufen.append(_geometrie_stufe(warped, "nach_scherung"))
             meldungen.append(f"Scherung {scherung:+.4f} ausgeglichen.")
         else:
             meldungen.append("Scherung verworfen (keine ausreichende Verbesserung).")
