@@ -561,7 +561,7 @@
       var n1 = Math.hypot(v1x, v1y), n2 = Math.hypot(v2x, v2y);
       if (n1 < 0.06 * b.diag || n2 < 0.06 * b.diag) { return false; }
       var cosw = (v1x * v2x + v1y * v2y) / (n1 * n2);
-      if (cosw > 0.57 || cosw < -0.57) { return false; }
+      if (cosw > 0.40 || cosw < -0.40) { return false; }
     }
     var l = [];
     for (i = 0; i < 4; i++) {
@@ -691,12 +691,13 @@
         s *= (1 + 0.18 * m.textur);
       }
       if (randSeiten && randSeiten[i]) {
-        // Bei niedrigem Kontrast Rand-Seiten weniger stark bestrafen? Nein,
-        // Rand bleibt schlecht, aber bei weiss-auf-weiss ist oft nur Rand verfuegbar
+        // Randkanten koennen Papierraender sein, bleiben aber gegenueber
+        // innenliegenden, bildgestuetzten Kanten benachteiligt.
         if (kontrastStd < 14) {
-          s = 4.5; strafe *= 0.75;
+          // Randkanten erhalten keine kuenstlich hohe Stuetzung.
+          s = 4.0; strafe *= 0.65;
         } else {
-          s = 3.0; strafe *= 0.6;
+          s = 2.6; strafe *= 0.50;
         }
       } else if (m.fort > Math.max(5, 0.75 * m.stuetze)) {
         // Fortsetzung hinter Kante: bei niedrigem Kontrast weniger streng
@@ -777,6 +778,7 @@
   function verfeinereSeite(b, a, c, suchweite, polaritaet, mitte) {
     var L = Math.hypot(c[0] - a[0], c[1] - a[1]);
     if (L < 10) { return null; }
+    var minSignal = b.kontrastStd < 14 ? 1.0 : 2.0;
     var dx = (c[0] - a[0]) / L, dy = (c[1] - a[1]) / L;
     var nx = -dy, ny = dx;
     if (mitte) {
@@ -796,7 +798,7 @@
         v *= 1 - 0.25 * Math.abs(s) / (suchweite + 1e-6);
         if (v > bestV) { bestV = v; bestS = s; }
       }
-      if (bestS !== null && bestV > 2) {
+      if (bestS !== null && bestV > minSignal) {
         punkte.push([px + bestS * nx, py + bestS * ny]);
       }
     }
@@ -1586,7 +1588,8 @@
       faktorX = fein.w / b.w; faktorY = fein.h / b.h;
       quad = quad.map(function (p) { return [p[0] * faktorX, p[1] * faktorY]; });
     }
-    var such = Math.max(4, (kiTraegt ? 0.012 : 0.022) * fein.diag);
+    // Breite erste Nachsuche erreicht auch ungenaue KI-Quads; danach wird enger verfeinert.
+    var such = Math.max(4, 0.035 * fein.diag);
     quad = verfeinere(fein, quad, such);
     quad = verfeinere(fein, quad, Math.max(3, such * 0.45));
 
