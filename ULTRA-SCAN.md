@@ -36,14 +36,15 @@ steht in [`models/HERKUNFT.md`](models/HERKUNFT.md) und im Abschnitt
 | `detect.js` | Live-Erkennung des Dokument-Vierecks in reinem JavaScript. Nimmt zusätzlich fremde Viereck-Vorschläge als Kandidaten entgegen. |
 | `detect-worker.js` | Winziger Worker, der `detect.js` lädt und jeden Sucher-Frame beantwortet. Reicht die KI-Vorschläge mit durch. |
 | `detect-nn.js` | Das neuronale Eckennetz (DocAligner) über onnxruntime-web. |
-| `nn-worker.js` | Eigener Worker nur für das Netz – es darf die Geometrie nie ausbremsen. |
-| `models/` | Das ONNX-Modell (4,6 MB) samt Lizenz und Herkunftsnachweis. |
+| `nn-worker.js` | Eigener Worker nur für das Netz – es darf die Geometrie nie ausbremsen. Rechnet auf Anfrage auch das Krümmungs-Gitter. |
+| `detect-uvdoc.js` | Sagt per UVDoc das Gitter voraus, das eine gebogene Buchseite flachlegt (ONNX, ~1 s, nur auf Anforderung). |
+| `models/` | Die ONNX-Modelle (Ecken 4,6 MB, Krümmung 8,1 MB) samt Lizenz und Herkunftsnachweis. |
 | `vendor/onnxruntime-web-1.20.1/` | ONNX-Laufzeit (WASM), selbst gehostet. |
 | `worker.js` | Pyodide im Web Worker, lädt `scanner` unverändert ins virtuelle Dateisystem. |
 | `app.js` | Oberfläche: Vollbildkamera, Live-Overlay, Auto-Auslöser, Scan-Liste, Teilen. |
 | `pdf.js` | Eigener minimaler PDF-Erzeuger (JPEG-Seiten), lokal, ohne Bibliothek. |
 | `app.css` | Liquid-Glass-Design, responsiv für iPhone und iPad (quer & hoch). |
-| `sw.js` | Service Worker, cacht die ~44 MB Laufzeit (Pyodide + ONNX) für schnelle Folgestarts. |
+| `sw.js` | Service Worker, cacht die ~37 MB Laufzeit (Pyodide + ONNX + Modelle) für schnelle Folgestarts. |
 
 ## Funktionen
 
@@ -112,12 +113,19 @@ Sucherbild
                         bestes Viereck
 ```
 
-**Warum nicht einfach dem Netz glauben?** Weil es sich irren kann und dann
-sehr selbstbewusst irrt. Also bekommt das Netz nur einen *Bonus* in der
-gemeinsamen Bewertung: `0.5 + 1.8 · Konfidenz²`. Quadratisch, nicht linear –
-ein linearer Bonus hat in den Messungen ein gutes klassisches Viereck gegen
-eine 0,46-Vermutung des Netzes verloren. Nur ab einer Konfidenz von 0,85
-darf das Netz die klassische Notlösung ganz überspringen.
+**Wer gewinnt?** Beides wird zunächst gleich behandelt; das Netz bekommt
+einen *Bonus* in der gemeinsamen Bewertung: `0.5 + 1.8 · Konfidenz²`.
+Quadratisch, nicht linear – ein linearer Bonus hat in den Messungen ein
+gutes klassisches Viereck gegen eine 0,46-Vermutung des Netzes verloren.
+
+Neu (und das war die eigentliche Erkenntnis): Ist das Netz **sicher**
+(Konfidenz ≥ 0,62, Fläche plausibel, Abstand zum klassischen Vorschlag
+größer als 3,5 % der Diagonale), bekommt es den Vorrang. Vorher hat die
+gemeinsame Bewertung das Netz auf weißen Untergründen regelmäßig
+überstimmt – obwohl das Netz dort messbar richtig lag. Auf den 15 harten
+Szenen (`tools/bench_live_ki.mjs`) sank der mittlere Eckfehler dadurch von
+6,9 % auf 3,7 % der Diagonale; im Sucher stammen 73 % der gezeichneten
+Rahmen vom Netz.
 
 **Warum ein eigener Worker?** Das Netz braucht rund 40 ms, die Geometrie 8 ms.
 Lägen beide im selben Worker, würde der Sucher auf das Netz warten. So läuft
@@ -125,13 +133,53 @@ das Netz nebenher (höchstens alle 60 ms ein Bild) und sein letztes Ergebnis
 gilt 700 ms lang als Kandidat weiter.
 
 **Beim Auslösen** läuft zusätzlich `erkenneGruendlich()`: dasselbe Netz,
-aber das Bild wird zusätzlich mit 12 % und 26 % Rand ringsum probiert. Das
-ist das Gegenmittel gegen die bekannte Schwäche solcher Netze – Ecken, die
-außerhalb des Bildes liegen, kleben sonst am Bildrand fest.
+aber das Bild wird nacheinander mit 12 %, 30 %, 20 % und 45 % Rand ringsum
+probiert und der sicherste Treffer gewinnt. Das ist das Gegenmittel gegen
+die bekannte Schwäche solcher Netze – Ecken, die außerhalb des Bildes
+liegen, kleben sonst am Bildrand fest. Im Sucher (`erkenneLive()`) laufen
+14 % Rand, und nur wenn das Ergebnis unsicher bleibt, kommt eine zweite
+Runde mit 28 % dazu.
+
+Dazu kommt eine feinere Eckenbestimmung: der Schwerpunkt der Heatmap wird
+jetzt parabelförmig verfeinert (3×3, mit 5×5-Rückfall). Das frühere große
+Fenster (±9 Kacheln = ±36 Bildpunkte) hat bei schräg verlaufenden
+Heatmaps die Ecke systematisch nach innen gemittelt – der Scan war dann
+eine Fingerbreite zu klein.
 
 Messergebnis auf 14 echten Handyfotos (`tools/bench_fusion.mjs`):
 **14 von 14 erkannt**, davon 11 über das Netz und 3 über die Geometrie,
-im Schnitt 47 ms. Die synthetische Suite bleibt unverändert bei 34/34.
+im Schnitt 41 ms. Die synthetische Suite bleibt unverändert bei 34/34.
+
+Gegenprobe auf 15 bewusst fiesen Szenen (`tools/testbilder_hart.py`,
+weißes Papier auf weißem Tuch, Stapel, Schatten, Blitz, gebogene
+Buchseiten): klassisch 7,34 % mittlerer Eckfehler, das Netz allein 1,55 %
+(`tools/bench_hart.mjs`).
+
+## Buchseiten flachlegen (UVDoc)
+
+Eine gebogene Buchseite bekommt man mit einer Perspektiv-Entzerrung nicht
+flach: Die vier Außenkanten werden gerade gezogen, die Wölbung zur Mitte
+bleibt – die Zeilen laufen durch. Dagegen läuft jetzt **UVDoc**
+(SIGGRAPH Asia 2023) aus `detect-uvdoc.js`:
+
+```
+Aufnahme ──► detect-uvdoc.js (ONNX, ~1 s)  ──► Gitter 2×45×31
+                                                   │
+Karussell: scan_wrapper.py entzerrt und misst die Zeilenbiegung
+           mit und ohne Gitter und nimmt das bessere Ergebnis
+```
+
+Warum der Umweg über das Gitter und nicht das fertige Bild? Gerechnet wird
+in JavaScript (dort liegt onnxruntime-web), angewendet mit OpenCV in
+Pyodide. Über die Worker-Grenze gehen nur 2 790 Gleitkommazahlen (11 KB).
+
+**Das Tor ist Pflicht, nicht Vorsicht:** Auf einer schon geraden Seite
+erzeugt UVDoc neue Wellen (gemessen: 0,48 px → 1,08 px Zeilenbiegung), auf
+einer gebogenen Buchseite glättet es stark (1,43 px → 0,45 px). Deshalb
+misst `scan_wrapper._kruemmung()` die Sagitta der Textzeilen, und das
+Gitter wird nur angewendet, wenn es sie um mindestens 10 % verkleinert.
+Auf 6 echten Fotos: 3× angewendet (Buchseiten), 2× „schon gerade“, 1×
+verworfen – jedes Mal die richtige Entscheidung.
 
 ## Veredelung: Halbtöne statt harter Maske
 
@@ -207,6 +255,11 @@ machen:
 * **[paperflow](https://www.chinglamlau.ca/writing/paperflow)** – praktische
   Hough-Verfeinerungen (ähnliche Linien gruppieren, jede Kante in ihrer
   eigenen Bildhälfte suchen).
+* **[tanguymagne/UVDoc](https://github.com/tanguymagne/UVDoc)** (MIT) –
+  „UVDoc: Neural Grid-based Document Unwarping“, SIGGRAPH Asia 2023. Sagt
+  ein 2D-Gitter voraus, das eine gewölbte Seite flachlegt (8 Mio. Parameter
+  statt 27–87 Mio. bei DocTr/DewarpNet). Vorbild für `detect-uvdoc.js` und
+  die Krümmungs-Glättung in `scan_wrapper.py`.
 * **Sauvola & Pietikäinen (2000)** – die Schwelle für den S/W-Stil.
 
 ## Hosting
@@ -251,6 +304,12 @@ python3 tools/hole_echtfotos.py /tmp/echtfotos     # Fotos aus 4 Repos holen
 python3 -m http.server 8080 &                      # Modell per HTTP bereitstellen
 node    tools/bench_fusion.mjs /tmp/echtfotos      # Erkennung: klassisch / KI / beides
 python3 tools/bench_veredelung.py /tmp/echtfotos   # Scan-Qualität alt gegen neu
+python3 tools/testbilder_hart.py /tmp/hart         # 15 harte Szenen + Live-Frames
+node    tools/bench_hart.mjs /tmp/hart             # klassisch / DocAligner / DocQuadNet
+node    tools/bench_live_ki.mjs /tmp/hart          # Sucher mit und ohne KI
+
+# Buchkruemmung: lohnt UVDoc auf diesen Fotos? (braucht quads.json)
+python3 tools/bench_kruemmung.py /tmp/rohtest
 ```
 
 `bench_fusion.mjs` lädt dieselben Dateien, die auch der Browser lädt –

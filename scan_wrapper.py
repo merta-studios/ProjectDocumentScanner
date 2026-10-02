@@ -541,16 +541,154 @@ def veredeln(bgr, modus="farbe"):
 # ===========================================================================
 # Hauptlauf
 # ===========================================================================
-def scan_bgr(src, hinweis=None, streng=False, veredelung="farbe"):
+# ===========================================================================
+# Buchkruemmung: UVDoc-Gitter (kommt aus detect-uvdoc.js)
+# ===========================================================================
+# Warum das hier steht und nicht in JavaScript:
+#   Das Gitter (2 x 45 x 31 Werte) beschreibt, woher jeder Bildpunkt eines
+#   flachgelegten Blattes im Foto stammt. Die Rechnung selbst (ein 8-Mio.-
+#   Parameter-Netz) laeuft in detect-uvdoc.js ueber onnxruntime-web - dort
+#   gibt es WebAssembly. Das Umrechnen der Bildpunkte macht OpenCV, das in
+#   Pyodide ohnehin geladen ist; 45x31 Werte ueber die Leitung zu schicken
+#   kostet nichts (11 KB).
+#
+# GEMESSEN, NICHT GERATEN - und deshalb mit Tor:
+#   UVDoc glaettet gebogene Buchseiten hervorragend (echtes Buchfoto:
+#   Zeilenkruemmung 1.43 px -> 0.45 px), auf einer bereits geraden Seite
+#   kann es aber neue Wellen erzeugen (0.48 px -> 1.08 px). Deshalb wird
+#   zuerst gemessen, wie krumm die entzerrte Seite ueberhaupt ist, und das
+#   Gitter nur angewendet, wenn es die Zeilen nachweislich gerader macht.
+
+UVDOC_GH = 45          # Gitterhoehe (Modellausgabe)
+UVDOC_GW = 31          # Gitterbreite
+
+
+def _kruemmung(img):
+    """Wie stark biegen sich die Textzeilen durch?
+
+    Mass: groesste Abweichung einer Textzeile von ihrer eigenen Geraden
+    (Sagitta), Median ueber alle erkannten Zeilen, in Pixel bei 700 px
+    Bildbreite. 0 = schnurgerade. Das Mass ist bewusst nicht von der
+    Aufloesung abhaengig, damit Schwellen ueberall gleich gelten.
+    """
+    g = cv2.cvtColor(_klein(img, 700), cv2.COLOR_BGR2GRAY)
+    if g.size == 0:
+        return 0.0
+    bw = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                               cv2.THRESH_BINARY_INV, 31, 10)
+    h, w = bw.shape
+    breite = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (max(3, int(w * 0.05)) | 1, 1))
+    konturen, _ = cv2.findContours(cv2.dilate(bw, breite),
+                                   cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    sags = []
+    for c in konturen:
+        x, y, cw, ch = cv2.boundingRect(c)
+        if cw < 0.3 * w or ch > 0.05 * h:
+            continue
+        maske = np.zeros((ch, cw), np.uint8)
+        cv2.drawContours(maske, [c - [x, y]], -1, 255, -1)
+        band = (bw[y:y + ch, x:x + cw] > 0) & (maske > 0)
+        xs, ys = [], []
+        for xi in range(0, cw, 3):
+            zeilen = np.where(band[:, xi])[0]
+            if zeilen.size:
+                xs.append(x + xi)
+                ys.append(y + float(zeilen.mean()))
+        if len(xs) < 20:
+            continue
+        xs = np.asarray(xs, np.float64)
+        ys = np.asarray(ys, np.float64)
+        k2 = np.polyfit(xs, ys, 2)
+        k1 = np.polyfit(xs, ys, 1)
+        xm = np.linspace(xs.min(), xs.max(), 50)
+        sags.append(float(np.max(np.abs(np.polyval(k2, xm)
+                                        - np.polyval(k1, xm)))))
+    return float(np.median(sags)) if sags else 0.0
+
+
+def _uvdoc_gitter_anwenden(bgr, gitter):
+    """Rechnet das Gitter auf ein Bild an (gleiche Regel wie detect-uvdoc.js:
+    Querformate werden vorher gedreht)."""
+    g = np.asarray(gitter, np.float32).reshape(2, UVDOC_GH, UVDOC_GW)
+    h, w = bgr.shape[:2]
+    quer = w > h
+    bild = np.ascontiguousarray(np.rot90(bgr)) if quer else bgr
+    H, W = bild.shape[:2]
+    up = np.stack([cv2.resize(g[k], (W, H), interpolation=cv2.INTER_LINEAR)
+                   for k in range(2)])
+    mx = ((up[0] + 1.0) * 0.5) * (W - 1.0)
+    my = ((up[1] + 1.0) * 0.5) * (H - 1.0)
+    aus = cv2.remap(bild, mx.astype(np.float32), my.astype(np.float32),
+                    cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return np.ascontiguousarray(np.rot90(aus, -1)) if quer else aus
+
+
+def _uvdoc_lohnt(src, hinweis, gitter):
+    """Prueft auf Arbeitsgroesse, ob das Gitter die Zeilen gerader macht.
+
+    Rueckgabe: (lohnt, krumm_vorher, krumm_nachher). Es wird nur EIN
+    zusaetzlicher Entzerrungsdurchgang auf 900 px gerechnet - im Sucher
+    faellt das nicht auf, und die Entscheidung ist damit gemessen statt
+    geraten.
+    """
+    klein = _klein(src, 900)
+    f = klein.shape[1] / float(src.shape[1])
+    quad_k = None
+    if hinweis is not None:
+        q = (np.asarray(hinweis, np.float64) * f)
+        if _quad_plausibel(q, klein.shape[0], klein.shape[1]):
+            quad_k = _ordne_robust(q)
+    if quad_k is None:
+        q2 = scanner.find_rough_quad(klein)
+        if q2 is not None:
+            q3 = scanner.refine_edges(klein, q2)
+            quad_k = _ordne_robust(q3 if q3 is not None else q2)
+    if quad_k is None:
+        return False, 0.0, 0.0
+
+    vorher = _kruemmung(entzerren(klein, quad_k))
+    if vorher <= 0.45:
+        return False, vorher, vorher          # Seite ist schon gerade
+    probiert = _kruemmung(entzerren(_uvdoc_gitter_anwenden(klein, gitter),
+                                    quad_k))
+    return (probiert < 0.9 * vorher), vorher, probiert
+
+
+def scan_bgr(src, hinweis=None, streng=False, veredelung="farbe", uvdoc=None):
     """Kompletter Hauptlauf der Original-Pipeline auf einem BGR-Bild.
 
     Rueckgabe: (hybrid_bgr, info_dict). info_dict enthaelt
     "dokument_erkannt" (bool) und "meldungen" (deutsche Statuszeilen).
     Mit streng=True wird nichts verarbeitet, wenn kein Dokument gefunden
     wurde (die App zeigt dann eine Meldung).
+    uvdoc: Gitter aus detect-uvdoc.js (2 x 45 x 31, -1..1) oder None.
     """
     meldungen = []
     info = {"dokument_erkannt": False, "meldungen": meldungen}
+
+    if uvdoc is not None:
+        try:
+            lohnt, vorher, nachher = _uvdoc_lohnt(src, hinweis, uvdoc)
+        except Exception as f:                      # niemals den Scan kippen
+            lohnt, vorher, nachher = False, 0.0, 0.0
+            meldungen.append("Kruemmungs-Pruefung nicht moeglich (%s)."
+                             % type(f).__name__)
+        info["kruemmung_vorher"] = round(float(vorher), 2)
+        info["kruemmung_nachher"] = round(float(nachher), 2)
+        if lohnt:
+            src = _uvdoc_gitter_anwenden(src, uvdoc)
+            info["uvdoc"] = "angewandt"
+            meldungen.append("Buchkruemmung geglaettet (Zeilenbiegung %.2f "
+                             "auf %.2f px)." % (vorher, nachher))
+        else:
+            info["uvdoc"] = "nicht_noetig" if vorher <= 0.45 else "verworfen"
+            if vorher > 0.45:
+                meldungen.append("Kruemmungs-Glaettung verworfen (haette die "
+                                 "Zeilen nicht gerader gemacht: %.2f -> %.2f "
+                                 "px)." % (vorher, nachher))
+    elif "uvdoc" not in info:
+        info["uvdoc"] = "kein_modell"
 
     quad, quelle = viereck_bestimmen(src, hinweis)
     info["dokument_erkannt"] = quad is not None
@@ -652,12 +790,13 @@ def scan_bgr(src, hinweis=None, streng=False, veredelung="farbe"):
     return ergebnis, info
 
 
-def scan_rgba(rgba_flat, hoehe, breite, quad=None, veredelung="farbe"):
+def scan_rgba(rgba_flat, hoehe, breite, quad=None, veredelung="farbe",
+              uvdoc=None):
     """Einstiegspunkt fuer die Web-App (Pyodide)."""
     arr = np.frombuffer(bytes(rgba_flat), dtype=np.uint8)
     arr = arr.reshape((int(hoehe), int(breite), 4))
     bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
-    hybrid, info = scan_bgr(bgr, quad, veredelung=veredelung)
+    hybrid, info = scan_bgr(bgr, quad, veredelung=veredelung, uvdoc=uvdoc)
     out = cv2.cvtColor(hybrid, cv2.COLOR_BGR2RGBA)
     h, w = out.shape[:2]
     return out.tobytes(), h, w, info
@@ -683,7 +822,8 @@ def quad_aus_rgba(rgba_flat, hoehe, breite):
     return [[float(p[0]), float(p[1])] for p in pts]
 
 
-def scan_rgba_streng(rgba_flat, hoehe, breite, quad=None, veredelung="farbe"):
+def scan_rgba_streng(rgba_flat, hoehe, breite, quad=None, veredelung="farbe",
+                     uvdoc=None):
     """Wie scan_rgba(), bricht aber ab, wenn kein Dokument erkannt wurde.
 
     Mit mitgegebenem Viereck (Live-Erkennung) gilt das Dokument als
@@ -694,7 +834,8 @@ def scan_rgba_streng(rgba_flat, hoehe, breite, quad=None, veredelung="farbe"):
     arr = np.frombuffer(bytes(rgba_flat), dtype=np.uint8)
     arr = arr.reshape((int(hoehe), int(breite), 4))
     bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
-    hybrid, info = scan_bgr(bgr, quad, streng=True, veredelung=veredelung)
+    hybrid, info = scan_bgr(bgr, quad, streng=True, veredelung=veredelung,
+                            uvdoc=uvdoc)
     if hybrid is None:
         return None, 0, 0, info
     out = cv2.cvtColor(hybrid, cv2.COLOR_BGR2RGBA)

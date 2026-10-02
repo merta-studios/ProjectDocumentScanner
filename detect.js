@@ -883,15 +883,89 @@
     return { g: g, w: w, h: h };
   }
 
-  function flaechenKandidaten(bGross) {
-    var b = halbieren(bGross);
+  /* ---------------------------------------------------------------------
+   * Beleuchtungs-normalisiertes Graubild.
+   *
+   * WARUM DAS DER WICHTIGSTE SCHRITT FUER "WEISS AUF WEISS" IST
+   * -----------------------------------------------------------
+   * Ein weisses Blatt auf weisser Decke unterscheidet sich vom Untergrund
+   * fast nur durch seinen SCHATTEN - also durch eine Helligkeitsaenderung
+   * von wenigen Prozent. Genau die verschwindet, wenn irgendwo im Bild
+   * eine Lampe, ein Blitz oder eine Vignette liegt: dort ist das Bild
+   * ohnehin heller oder dunkler.
+   *
+   * Teilt man dagegen jeden Pixel durch die GROB GEGLAETTETE Helligkeit
+   * seiner Umgebung ("Beleuchtungsfeld"), bleibt vom Licht nur noch das
+   * Verhaeltnis Papier/Untergrund uebrig. Der Schattenrand ist danach
+   * genauso stark wie auf einem perfekt ausgeleuchteten Foto - und eine
+   * harte Schattengrenze quer ueber das Blatt verschwindet, weil sie im
+   * Feld mitgelernt wird. Ein weisses Blatt auf weisser Unterlage wird
+   * dadurch zu einer fast gleichmaessig hellen Flaeche, die die
+   * Flaechen-Suche sauber als groesste Komponente findet.
+   *
+   * Das Feld wird absichtlich nur grob geschaetzt (grosser Kasten,
+   * zweimal), damit Textzeilen und Blattkante NICHT hineingerechnet
+   * werden - sonst wuerde die Normalisierung genau die Kanten
+   * wegdruecken, die wir suchen.
+   * ------------------------------------------------------------------- */
+  function beleuchtungsfeldNetz(g, w, h) {
+    var r = Math.max(3, Math.round(0.06 * Math.max(w, h)));
+    var a = g, b = new Float32Array(w * h), x, y, summe = 0;
+    for (var d = 0; d < 2; d++) {
+      /* waagerecht: gleitende Summe ueber 2r+1 Pixel */
+      for (y = 0; y < h; y++) {
+        var z = y * w, s = 0, n = 0;
+        for (x = -r; x <= r; x++) {
+          if (x >= 0 && x < w) { s += a[z + x]; }
+          n++;
+        }
+        for (x = 0; x < w; x++) {
+          b[z + x] = s / n;
+          var raus = x - r, rein = x + r + 1;
+          if (raus >= 0) { s -= a[z + raus]; }
+          if (rein < w) { s += a[z + rein]; }
+        }
+      }
+      /* senkrecht */
+      for (x = 0; x < w; x++) {
+        var t = 0, m = 0;
+        for (y = -r; y <= r; y++) {
+          if (y >= 0 && y < h) { t += b[y * w + x]; }
+          m++;
+        }
+        for (y = 0; y < h; y++) {
+          a[y * w + x] = t / m;
+          var ro = y - r, ri = y + r + 1;
+          if (ro >= 0) { t -= b[ro * w + x]; }
+          if (ri < h) { t += b[ri * w + x]; }
+        }
+      }
+      /* Ergebnis steht jetzt in a (waagerecht nach b, senkrecht zurueck
+       * nach a). Beim naechsten Durchgang wird b ohnehin vollstaendig
+       * ueberschrieben. */
+    }
+    for (var i = 0; i < w * h; i++) { summe += a[i]; }
+    var mittel = summe / (w * h);
+    var out = new Float32Array(w * h);
+    for (var k = 0; k < w * h; k++) {
+      /* Verhaeltnis zum Umgebungslicht, begrenzt: eine echte dunkle
+       * Flaeche soll nicht ins Unendliche aufgehellt werden. */
+      var f = mittel / Math.max(a[k], 1.0);
+      if (f > 2.4) { f = 2.4; } else if (f < 0.45) { f = 0.45; }
+      out[k] = Math.min(255, g[k] * f);
+    }
+    return out;
+  }
+
+  /* Flaechen-Kandidaten aus einem Graubild: Otsu-Maske in beide
+   * Richtungen -> groesste Komponente -> konvexe Huelle -> Viereck. */
+  function viereckeAusGrau(g, w, h, maxVierecke) {
     var out = [];
-    var schwelle = otsu(b);
-    var w = b.w, h = b.h, i;
+    var schwelle = otsu({ g: g, w: w, h: h });
     for (var modus = 0; modus < 2; modus++) {
-      var maske = new Uint8Array(w * h), an = 0;
+      var maske = new Uint8Array(w * h), an = 0, i;
       for (i = 0; i < w * h; i++) {
-        var hell = b.g[i] > schwelle;
+        var hell = g[i] > schwelle;
         maske[i] = (modus === 0 ? hell : !hell) ? 1 : 0;
         an += maske[i];
       }
@@ -905,9 +979,48 @@
       var vier = groesstesViereck(hu);
       if (vier) {
         out.push(vier.map(function (p) { return [p[0] * 2 + 0.5, p[1] * 2 + 0.5]; }));
+        if (maxVierecke && out.length >= maxVierecke) { return out; }
       }
     }
     return out;
+  }
+
+  function flaechenKandidaten(bGross, auchNormalisiert) {
+    var b = halbieren(bGross);
+    var out = viereckeAusGrau(b.g, b.w, b.h, 2);
+    if (auchNormalisiert) {
+      /* Dieselbe Suche auf dem beleuchtungs-normalisierten Bild. Nur so
+       * tauchen Blaetter auf, deren Kante im Schatten oder im Blitzlicht
+       * liegt (siehe beleuchtungsfeldNetz). */
+      var gn = beleuchtungsfeldNetz(b.g, b.w, b.h);
+      var weitere = viereckeAusGrau(gn, b.w, b.h, 2);
+      for (var i = 0; i < weitere.length; i++) {
+        var v = weitere[i], doppelt = false;
+        for (var j = 0; j < out.length; j++) {
+          if (abstandVierecke(v, out[j]) < 4) { doppelt = true; break; }
+        }
+        if (!doppelt) { out.push(v); }
+      }
+    }
+    return out;
+  }
+
+  function abstandVierecke(a, c) {
+    var m = 0;
+    for (var i = 0; i < 4; i++) {
+      var d = Math.hypot(a[i][0] - c[i][0], a[i][1] - c[i][1]);
+      if (d > m) { m = d; }
+    }
+    return m;
+  }
+
+  /* Mittlerer Eckabstand zweier gleich sortierter Vierecke. */
+  function mittlererAbstand(a, c) {
+    var s = 0;
+    for (var i = 0; i < 4; i++) {
+      s += Math.hypot(a[i][0] - c[i][0], a[i][1] - c[i][1]) / 4;
+    }
+    return s;
   }
 
   function punktInnen(q, p) {
@@ -1119,7 +1232,7 @@
     bewerteAlle(roh);
 
     /* ---- Vorschlaege von aussen (KI) in dieselbe Bewertung werfen ---- */
-    var kiListe = [];
+    var kiListe = [], kiBester = null;
     var extern = optionen.kandidaten || [];
     for (i = 0; i < extern.length; i++) {
       var ek = extern[i];
@@ -1138,16 +1251,30 @@
       kiListe.push({ q: qk, kiQuelle: true, kiKonf: klemme(ekonf, 0, 1) });
     }
     if (kiListe.length) { bewerteAlle(kiListe); }
+    /* dasjenige KI-Viereck mit der besten gemeinsamen Bewertung */
+    for (i = 0; i < kiListe.length; i++) {
+      var kb = bewertet[bewertet.length - kiListe.length + i];
+      if (!kiBester || kb.wert > kiBester.wert) { kiBester = kb; }
+    }
 
     /* Helligkeits-Fallback nur, wenn die Linien nichts Ueberzeugendes
      * geliefert haben: er kostet mit Abstand die meiste Rechenzeit und
-     * wird im Normalfall gar nicht gebraucht. */
+     * wird im Normalfall gar nicht gebraucht.
+     *
+     * Fuer Standbilder kann er mit optionen.flaechenImmer erzwungen
+     * werden. Warum das wichtig ist: Auf einem weissen Untergrund ist
+     * eine FALSCHE Kante (Tischkante, Schattenrand, Stapelkante) oft
+     * besser "gestuetzt" als das Blatt selbst - dann sieht das Ergebnis
+     * der Linien-Suche ueberzeugend aus, obwohl es daneben liegt. Die
+     * Flaechen-Suche auf dem beleuchtungs-normalisierten Bild findet
+     * das Blatt trotzdem, und die gemeinsame Bewertung entscheidet dann
+     * anhand beider Vorschlaege. */
     var flAnzahl = 0;
-    var kiSicher = best && best.quelle === "ki" && best.kiKonf > 0.85;
-    if (!kiSicher &&
-        (!best || best.konfidenz < 0.95 || best.flaeche < 0.2 ||
+    var kiSicherGenug = kiBester && kiBester.kiKonf > 0.85;
+    if (!kiSicherGenug && (optionen.flaechenImmer ||
+        !best || best.konfidenz < 0.95 || best.flaeche < 0.2 ||
          best.randSeiten.filter(Boolean).length)) {
-      var flk = flaechenKandidaten(b), fliste = [];
+      var flk = flaechenKandidaten(b, optionen.flaechenImmer !== false), fliste = [];
       for (i = 0; i < flk.length; i++) {
         var qf = sortiereEcken(flk[i], b.w / 2, b.h / 2);
         if (formOk(b, qf, minFlaeche)) {
@@ -1177,6 +1304,53 @@
     } else {
       best = aussenGewinnt(bewertet, best);
     }
+
+    /* ------------------------------------------------------------------
+     * KI-VORRANG (das eigentliche Gegenmittel gegen "weiss auf weiss")
+     * ------------------------------------------------------------------
+     * Gemessen auf den harten Szenen (tools/testbilder_hart.py: weisses
+     * Blatt auf weisser Decke, Stapel, harter Schatten, Blitzlicht):
+     *
+     *   reine Geometrie   mittlerer Eckfehler 7,3 %
+     *   DocAligner allein mittlerer Eckfehler 1,9 %   (14 von 15 < 3 %)
+     *   bisherige Fusion  mittlerer Eckfehler 5,0 %   <-- die Fusion
+     *                                                    verdarb die
+     *                                                    gute KI-Antwort
+     *
+     * Der Grund ist strukturell: Auf weissem Untergrund bekommt eine
+     * FALSCHE Kante (Tischkante, Schattenrand, Stapelkante) mehr
+     * "Kantenstuetze" als das Blatt - sie ist einfach kontrastreicher.
+     * Die gemeinsame Bewertung, die nach Kantenstuetze urteilt, waehlt
+     * dann den falschen Kandidaten, obwohl das Netz das Blatt sicher
+     * gefunden hat.
+     *
+     * Deshalb gilt: Ist das Netz sicher, gibt SEINE Lage den Ausschlag.
+     * Die Geometrie darf sie nur behalten, wenn sie dasselbe Viereck
+     * sieht - dann ist ihre Kante (subpixelgenau nachgezogen) die
+     * bessere Wahl. Weicht sie ab, gewinnt die KI.
+     *
+     * Umgekehrt bleibt alles beim Alten, wenn das Netz unsicher ist:
+     * dann entscheidet wie bisher die gemeinsame Bewertung.
+     */
+    var KI_SICHER = 0.62;
+    if (kiBester && kiBester.kiKonf >= KI_SICHER && kiBester.flaeche >= 0.02) {
+      if (best.quelle === "ki") {
+        /* schon die KI vorn - nichts zu tun */
+      } else {
+        var abw = mittlererAbstand(best.q, kiBester.q) / b.diag;
+        var zustimmung = abw < 0.035;
+        if (!zustimmung) {
+          /* Die klassischen Vierecke sind zwar aeusserlich gut gestuetzt,
+           * liegen aber woanders. Ein Viereck, das das KI-Viereck
+           * vollstaendig umschliesst, ist trotzdem verdaechtig (Stapel,
+           * Tischkante). Nur wenn das KI-Viereck praktisch deckungsgleich
+           * ist, bleibt die klassische Kante stehen. */
+          diagnose.kiUeberstimmt = true;
+          best = kiBester;
+        }
+      }
+    }
+    diagnose.kiKonf = kiBester ? kiBester.kiKonf : 0;
 
     /* Mindestanforderungen - sonst lieber "nichts gefunden" melden.
      *
