@@ -126,33 +126,105 @@ function fehler() { return ladeFehler; }
  * scan_wrapper.py dreht beim Anwenden nach derselben Regel zurueck -
  * beide Seiten muessen sich einig sein.
  */
+/* Beleuchtungsfeld schaetzen fuer UVDoc: Schatten rausrechnen, damit
+ * gebogene Seiten auch bei starkem Schatten erkannt werden. Vereinfachte
+ * Version von scan_wrapper.beleuchtungsfeld: 480px Downscale, Closing,
+ * dann Division. */
+function beleuchtungsFeldFuerUVDoc(rgba, breite, hoehe) {
+  var f = Math.max(breite, hoehe) / 480;
+  if (f < 1) { f = 1; }
+  var dw = Math.max(16, Math.round(breite / f));
+  var dh = Math.max(16, Math.round(hoehe / f));
+  var g = new Float32Array(dw * dh);
+  var anz = new Float32Array(dw * dh);
+  var xi = new Int32Array(breite), yi = new Int32Array(hoehe);
+  for (var x = 0; x < breite; x++) { xi[x] = Math.min(dw - 1, (x * dw / breite) | 0); }
+  for (var y = 0; y < hoehe; y++) { yi[y] = Math.min(dh - 1, (y * dh / hoehe) | 0); }
+  for (var y = 0; y < hoehe; y++) {
+    var zeile = y * breite * 4, ziel = yi[y] * dw;
+    for (var x = 0; x < breite; x++) {
+      var p = zeile + x * 4;
+      var l = (rgba[p] * 299 + rgba[p + 1] * 587 + rgba[p + 2] * 114) * 0.001;
+      var k = ziel + xi[x];
+      g[k] += l; anz[k]++;
+    }
+  }
+  for (var i = 0; i < dw * dh; i++) { g[i] = anz[i] ? g[i] / anz[i] : 0; }
+  // Closing + Median + Gauss vereinfacht: 2x Box-Blur gross
+  var r = Math.max(2, Math.round(0.06 * Math.max(dw, dh)));
+  var tmp = new Float32Array(dw * dh);
+  // Horizontal
+  for (var y = 0; y < dh; y++) {
+    var z = y * dw, s = 0;
+    for (var x = -r; x <= r; x++) { if (x >= 0 && x < dw) { s += g[z + x]; } }
+    for (var x = 0; x < dw; x++) {
+      tmp[z + x] = s / (2 * r + 1);
+      var raus = x - r, rein = x + r + 1;
+      if (raus >= 0) { s -= g[z + raus]; }
+      if (rein < dw) { s += g[z + rein]; }
+    }
+  }
+  // Vertikal
+  var feld = new Float32Array(dw * dh);
+  for (var x = 0; x < dw; x++) {
+    var s2 = 0;
+    for (var y = -r; y <= r; y++) { if (y >= 0 && y < dh) { s2 += tmp[y * dw + x]; } }
+    for (var y = 0; y < dh; y++) {
+      feld[y * dw + x] = s2 / (2 * r + 1);
+      var ro = y - r, ri = y + r + 1;
+      if (ro >= 0) { s2 -= tmp[ro * dw + x]; }
+      if (ri < dh) { s2 += tmp[ri * dw + x]; }
+    }
+  }
+  // Mittelwert
+  var sum = 0;
+  for (var i = 0; i < dw * dh; i++) { sum += feld[i]; }
+  var mittel = sum / (dw * dh) || 128;
+  // Gewinn pro Kachel
+  var gewinn = new Float32Array(dw * dh);
+  for (var i = 0; i < dw * dh; i++) {
+    var gwin = mittel / Math.max(feld[i], 1);
+    if (gwin > 2.8) { gwin = 2.8; } else if (gwin < 0.45) { gwin = 0.45; }
+    gewinn[i] = gwin;
+  }
+  return { gewinn: gewinn, dw: dw, dh: dh, xi: xi, yi: yi };
+}
+
 function tensorBauen(rgba, breite, hoehe) {
   var quer = breite > hoehe;
-  var sw = quer ? hoehe : breite;                 // Quellbreite im gedrehten Bild
-  var sh = quer ? breite : hoehe;                 // Quellhoehe
+  var sw = quer ? hoehe : breite;
+  var sh = quer ? breite : hoehe;
   var n = EW * EH;
   var daten = new Float32Array(3 * n);
   var anz = new Float32Array(n);
-
   var xi = new Int32Array(sw), yi = new Int32Array(sh);
   var x, y;
   for (x = 0; x < sw; x++) { xi[x] = Math.min(EW - 1, (x * EW / sw) | 0); }
   for (y = 0; y < sh; y++) { yi[y] = Math.min(EH - 1, (y * EH / sh) | 0); }
 
+  // Beleuchtungsfeld fuer Schatten-Korrektur
+  var licht = null;
+  try { licht = beleuchtungsFeldFuerUVDoc(rgba, breite, hoehe); } catch (e) { licht = null; }
+
   for (y = 0; y < sh; y++) {
     var ziel = yi[y] * EW;
     for (x = 0; x < sw; x++) {
-      /* Gedreht wird wie numpy.rot90 in scan_wrapper.py:
-       *   gedreht(y, x) = original(y_alt = x, x_alt = breite-1-y)
-       * sw/sh sind Breite/Hoehe des GEDREHTEN Bildes, also ist
-       * sh == breite und sw == hoehe. */
       var ox = quer ? (sh - 1 - y) : x;
       var oy = quer ? x : y;
       var p = (oy * breite + ox) * 4;
       var k = ziel + xi[x];
-      daten[k] += rgba[p];            /* R */
-      daten[n + k] += rgba[p + 1];    /* G */
-      daten[2 * n + k] += rgba[p + 2];/* B */
+      var r = rgba[p], g = rgba[p + 1], b = rgba[p + 2];
+      if (licht) {
+        // Gewinn aus Lichtfeld holen
+        var lx = licht.xi[ox], ly = licht.yi[oy];
+        var gw = licht.gewinn[ly * licht.dw + lx] || 1;
+        r = Math.min(255, r * gw);
+        g = Math.min(255, g * gw);
+        b = Math.min(255, b * gw);
+      }
+      daten[k] += r;
+      daten[n + k] += g;
+      daten[2 * n + k] += b;
       anz[k]++;
     }
   }
@@ -163,6 +235,48 @@ function tensorBauen(rgba, breite, hoehe) {
     daten[2 * n + i] = daten[2 * n + i] / c / 255;
   }
   return { daten: daten, quer: quer };
+}
+
+/* Gitter glaetten fuer Tabellen-Schutz: leichte Gauss-Glaettung
+ * reduziert hochfrequentes Wobbeln, das Tabellenlinien verbiegt.
+ * Inspiriert von DewarpLab "Preserve vertical geometry". */
+function gitterGlaetten(gitter) {
+  // gitter: Float32Array 2*45*31
+  var GH = 45, GW = 31;
+  var out = new Float32Array(gitter.length);
+  out.set(gitter);
+  // 3x3 Gauss 1-2-1
+  for (var c = 0; c < 2; c++) {
+    var off = c * GH * GW;
+    // Horizontal
+    var tmp = new Float32Array(GH * GW);
+    for (var y = 0; y < GH; y++) {
+      var z = y * GW;
+      for (var x = 0; x < GW; x++) {
+        var l = out[off + z + (x > 0 ? x - 1 : 0)];
+        var r = out[off + z + (x < GW - 1 ? x + 1 : GW - 1)];
+        var m = out[off + z + x];
+        tmp[z + x] = (l + 2 * m + r) * 0.25;
+      }
+    }
+    // Vertikal
+    for (var x = 0; x < GW; x++) {
+      for (var y = 0; y < GH; y++) {
+        var o = tmp[(y > 0 ? y - 1 : 0) * GW + x];
+        var u = tmp[(y < GH - 1 ? y + 1 : GH - 1) * GW + x];
+        var mm = tmp[y * GW + x];
+        out[off + y * GW + x] = (o + 2 * mm + u) * 0.25;
+      }
+    }
+  }
+  // Mische Original + geglaettet: 70% Original, 30% geglaettet fuer Erhalt von Details
+  // Bei sehr starker Kruemmung wollen wir Details behalten, bei leichter eher glaetten
+  // Hier feste Mischung 0.8/0.2 fuer Kompromiss
+  var res = new Float32Array(gitter.length);
+  for (var i = 0; i < gitter.length; i++) {
+    res[i] = gitter[i] * 0.82 + out[i] * 0.18;
+  }
+  return res;
 }
 
 /* ----------------------------------------------------------------------
@@ -188,9 +302,9 @@ async function gitter(rgba, breite, hoehe) {
       if (t && t.dims && t.dims.length === 4 && t.dims[1] === 2) { g = t; break; }
     }
   }
+  var finalGitter = null;
   if (!g || !g.data || g.data.length !== 2 * GH * GW) {
     if (g && g.data && g.dims && g.dims[2] === GW && g.dims[3] === GH) {
-      /* anderer Export mit vertauschten Gitterachsen (2 x 31 x 45) */
       var d = g.data, u = new Float32Array(2 * GH * GW);
       for (var c = 0; c < 2; c++) {
         for (var i2 = 0; i2 < GH; i2++) {
@@ -199,11 +313,37 @@ async function gitter(rgba, breite, hoehe) {
           }
         }
       }
-      return { gitter: u, quer: vor.quer };
+      finalGitter = u;
+    } else {
+      return null;
     }
-    return null;
+  } else {
+    finalGitter = g.data;
   }
-  return { gitter: g.data, quer: vor.quer };
+  // Plausibilitaet: Gitter muss innerhalb [-1.2,1.2] liegen und monoton-ish sein
+  // Bei extremen Werten -> verwerfen (verhindert katastrophales Verrutschen)
+  var maxAbs = 0;
+  for (var i = 0; i < finalGitter.length; i++) {
+    var av = Math.abs(finalGitter[i]);
+    if (av > maxAbs) { maxAbs = av; }
+  }
+  if (maxAbs > 1.5) { return null; } // zu extrem -> verwerfen
+
+  // Glattung fuer Tabellen-Schutz
+  try {
+    var geglaettet = gitterGlaetten(finalGitter);
+    // Pruefe ob Glaettung nicht zu stark abweicht (max 0.08 Differenz)
+    var diffSum = 0;
+    for (var j = 0; j < finalGitter.length; j++) {
+      diffSum += Math.abs(finalGitter[j] - geglaettet[j]);
+    }
+    var avgDiff = diffSum / finalGitter.length;
+    if (avgDiff < 0.12) {
+      finalGitter = geglaettet;
+    }
+  } catch (e) { /* egal */ }
+
+  return { gitter: finalGitter, quer: vor.quer };
 }
 
 export { lade, lade as laden, gitter, bereit, fehler, setzeBasis };

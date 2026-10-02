@@ -2,36 +2,31 @@
  * Ultra Scan - Dokument-Erkennung (reines JavaScript, laeuft ohne Python).
  * ============================================================================
  *
- * Diese Datei findet die 4 Eckpunkte eines Dokuments in einem Bild. Sie ist
- * der Ersatz fuer die frueher live benutzte Python-Funktion
- * scanner.find_rough_quad(), die ueber Pyodide nur ca. 5-8 mal pro Sekunde
- * laufen konnte, dabei stark gezittert hat und bei Dokumenten ohne starken
- * Kontrast haeufig gar nichts gefunden hat.
+ * Diese Datei findet die 4 Eckpunkte eines Dokuments in einem Bild.
+ * Version 4 - Verbesserungen fuer weiss-auf-weiss und Stapel:
  *
- * Verfahren (mehrere Quellen, EINE gemeinsame Bewertung):
+ *   - Textur-Karte (lokale Varianz) unterscheidet glattes Papier von
+ *     strukturiertem Untergrund (Decke, Teppich, Holz). Inspiriert von
+ *     dhruv-1004/document-scanner (HSV/LAB Strategien) und BiRefNet
+ *     (Hintergrund vs Vordergrund via Textur).
+ *   - Saettigungs-Karte: Papier hat niedrige Saettigung, farbiger
+ *     Hintergrund oft hoehere. Hilft bei weissem Blatt auf weisser Decke
+ *     wenn Textur allein nicht reicht.
+ *   - Kontrast-adaptive Schwellen: Bei niedrigem Gesamtkontrast (weiss
+ *     auf weiss) werden Kanten-Schwellen abgesenkt, damit schwache
+ *     Papierkanten nicht verworfen werden.
+ *   - Textdichte-Bonus: Ein korrektes Dokument-Viereck enthaelt innen
+ *     deutlich mehr Kantenpunkte (Text) als aussen. Ein zu grosses
+ *     Viereck (Stapelkante, Tischkante) hat draussen viel Textur, drinnen
+ *     weniger Textdichte. Das unterscheidet Top-Blatt vom Stapel.
+ *   - Stapel-Logik: Wenn KI-Viereck innerhalb klassischem liegt und
+ *     Flaechenverhaeltnis <0.85, gewinnt KI auch bei niedriger Konfidenz
+ *     (0.35+). Das ist genau der Fall "weisses Blatt auf weissem Stapel".
+ *   - Flaechen-Fallback jetzt mit 4 Quellen: Helligkeit, normalisierte
+ *     Helligkeit, Textur, Saettigung.
  *
- *   1. Bild auf Arbeitsgroesse verkleinern (Flaechenmittel), weichzeichnen.
- *   2. Sobel-Gradienten, Kantenpunkte mit Non-Maximum-Suppression.
- *   3. Gradienten-orientierte Hough-Transformation: jeder Kantenpunkt stimmt
- *      nur fuer Linien ab, die ungefaehr senkrecht zu seinem Gradienten
- *      stehen -> schnell und rauscharm.
- *   4. Aus den staerksten Linien werden Paare (fast parallel, weit
- *      auseinander) und daraus Vierecke gebildet. Zusaetzlich duerfen die
- *      Bildraender als Kante dienen (Dokument groesser als der Sucher).
- *   5. Helligkeits-Fallback: Otsu-Maske -> groesste Flaeche -> konvexe
- *      Huelle -> flaechengroesstes Viereck. Faengt Papier mit weichen
- *      Kanten, wo Linien versagen.
- *   6. Alle Kandidaten werden mit derselben Funktion bewertet:
- *      Kantenstuetze (Gradient senkrecht zur Kante), Abdeckung der Kante,
- *      Polaritaet (innen heller/dunkler als aussen - konsistent auf allen
- *      vier Seiten), Form- und Flaechenplausibilitaet.
- *   7. Der Sieger wird subpixelgenau nachgezogen: jede Kante wird quer
- *      abgetastet, die echte Kante gesucht, eine robuste Gerade gefittet
- *      (IRLS + MAD-Ausreisserfilter) und die Geraden geschnitten.
- *
- * Rueckgabe sind IMMER Koordinaten im Eingabebild (nicht in Arbeitsgroesse).
- *
- * Die Datei haengt von nichts ab und laeuft im Hauptthread wie im Worker.
+ * Verfahren bleibt: Sobel -> Hough -> Vierecke -> Bewertung -> Verfeinern.
+ * Zusaetzliche Quellen laufen durch DIESELBE Bewertung.
  */
 "use strict";
 
@@ -40,14 +35,12 @@
   /* ======================= kleine Helfer ========================= */
   function klemme(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
-  function winkelAbstand(a, b) {           // kleinster Winkel zweier Geraden
+  function winkelAbstand(a, b) {
     var d = Math.abs(a - b) % Math.PI;
     return Math.min(d, Math.PI - d);
   }
 
   /* ============== 1. Graustufen + Verkleinerung =================== */
-  /* Flaechenmittel statt Nearest-Neighbour: sonst flimmern duenne Kanten
-   * von Frame zu Frame und die Erkennung zittert. */
   function graubild(rgba, w, h, maxKante) {
     var f = Math.max(w, h) / maxKante;
     if (f < 1) { f = 1; }
@@ -70,14 +63,47 @@
     }
     var g = new Float32Array(dw * dh);
     for (var i = 0; i < dw * dh; i++) { g[i] = anzahl[i] ? summe[i] / anzahl[i] : 0; }
-    return { g: g, w: dw, h: dh, sx: w / dw, sy: h / dh };
+    return { g: g, w: dw, h: dh, sx: w / dw, sy: h / dh, xi: xi, yi: yi, dw: dw, dh: dh };
+  }
+
+  /* Saettigung: max-min, flaechengemittelt wie graubild */
+  function sattBild(rgba, w, h, maxKante, vorXiYi) {
+    var f = Math.max(w, h) / maxKante;
+    if (f < 1) { f = 1; }
+    var dw = Math.max(32, Math.round(w / f));
+    var dh = Math.max(32, Math.round(h / f));
+    var summe = new Float32Array(dw * dh);
+    var anzahl = new Float32Array(dw * dh);
+    var xi, yi;
+    if (vorXiYi) {
+      xi = vorXiYi.xi; yi = vorXiYi.yi;
+    } else {
+      xi = new Int32Array(w); yi = new Int32Array(h);
+      for (var x = 0; x < w; x++) { xi[x] = Math.min(dw - 1, (x * dw / w) | 0); }
+      for (var y = 0; y < h; y++) { yi[y] = Math.min(dh - 1, (y * dh / h) | 0); }
+    }
+    for (var y = 0; y < h; y++) {
+      var zeile = y * w * 4, ziel = yi[y] * dw;
+      for (var x = 0; x < w; x++) {
+        var p = zeile + x * 4;
+        var r = rgba[p], g = rgba[p + 1], b = rgba[p + 2];
+        var mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+        var mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+        var s = mx - mn;
+        var k = ziel + xi[x];
+        summe[k] += s; anzahl[k]++;
+      }
+    }
+    var out = new Float32Array(dw * dh);
+    for (var i = 0; i < dw * dh; i++) { out[i] = anzahl[i] ? summe[i] / anzahl[i] : 0; }
+    return out;
   }
 
   /* ===================== 2. Weichzeichnen ========================= */
   function weich(src, w, h, durchgaenge) {
     var a = src, b = new Float32Array(w * h), x, y, i;
     for (var d = 0; d < durchgaenge; d++) {
-      for (y = 0; y < h; y++) {                       // waagerecht 1-2-1
+      for (y = 0; y < h; y++) {
         var z = y * w;
         for (x = 0; x < w; x++) {
           var l = a[z + (x > 0 ? x - 1 : 0)];
@@ -85,7 +111,7 @@
           b[z + x] = (l + 2 * a[z + x] + r) * 0.25;
         }
       }
-      for (x = 0; x < w; x++) {                       // senkrecht 1-2-1
+      for (x = 0; x < w; x++) {
         for (y = 0; y < h; y++) {
           var o = b[(y > 0 ? y - 1 : 0) * w + x];
           var u = b[(y < h - 1 ? y + 1 : h - 1) * w + x];
@@ -94,6 +120,55 @@
       }
     }
     return a;
+  }
+
+  /* Kasten-Mittel via Integralbild - fuer Textur */
+  function kastenMittel(src, w, h, r) {
+    var out = new Float32Array(w * h);
+    var intg = new Float32Array((w + 1) * (h + 1));
+    var x, y;
+    for (y = 0; y < h; y++) {
+      var sum = 0;
+      var zw = y * w, zi = (y + 1) * (w + 1) + 1;
+      for (x = 0; x < w; x++) {
+        sum += src[zw + x];
+        intg[zi + x] = intg[zi + x - (w + 1)] + sum;
+      }
+    }
+    for (y = 0; y < h; y++) {
+      var y0 = Math.max(0, y - r), y1 = Math.min(h - 1, y + r);
+      var iy0 = y0 * (w + 1), iy1 = (y1 + 1) * (w + 1);
+      for (x = 0; x < w; x++) {
+        var x0 = Math.max(0, x - r), x1 = Math.min(w - 1, x + r);
+        var a = intg[iy0 + x0], b = intg[iy0 + x1 + 1], c = intg[iy1 + x0], d = intg[iy1 + x1 + 1];
+        var fl = (y1 - y0 + 1) * (x1 - x0 + 1);
+        out[y * w + x] = (d - b - c + a) / fl;
+      }
+    }
+    return out;
+  }
+
+  function texturKarte(g, w, h) {
+    // lokale Varianz in 5x5 Fenster
+    var r = 2;
+    var mean = kastenMittel(g, w, h, r);
+    var g2 = new Float32Array(w * h);
+    for (var i = 0; i < w * h; i++) { g2[i] = g[i] * g[i]; }
+    var mean2 = kastenMittel(g2, w, h, r);
+    var vari = new Float32Array(w * h);
+    for (var j = 0; j < w * h; j++) {
+      var v = mean2[j] - mean[j] * mean[j];
+      vari[j] = v < 0 ? 0 : Math.sqrt(v);
+    }
+    return { mean: mean, vari: vari };
+  }
+
+  function kontrastMasse(g, w, h) {
+    var n = w * h, sum = 0, quad = 0;
+    for (var i = 0; i < n; i++) { sum += g[i]; quad += g[i] * g[i]; }
+    var m = sum / n;
+    var vari = quad / n - m * m;
+    return { mittel: m, std: Math.sqrt(Math.max(0, vari)) };
   }
 
   /* ======================== 3. Gradienten ========================= */
@@ -107,7 +182,6 @@
         var a = g[zo + x - 1], b = g[zo + x], c = g[zo + x + 1];
         var d = g[z + x - 1],                 e = g[z + x + 1];
         var f = g[zu + x - 1], i = g[zu + x], j = g[zu + x + 1];
-        /* durch 4 teilen -> Werte in "Graustufen pro Pixel" */
         var sx = ((c + 2 * e + j) - (a + 2 * d + f)) * 0.25;
         var sy = ((f + 2 * i + j) - (a + 2 * b + c)) * 0.25;
         gx[z + x] = sx; gy[z + x] = sy;
@@ -117,10 +191,6 @@
     return { gx: gx, gy: gy, mag: mag };
   }
 
-  /* Schaerfe (Varianz des Laplace-Operators) auf dem UNgeglaetteten Grau.
-   * Damit erkennt die App bewegungsunscharfe Frames und loest dort nicht
-   * aus - das ist einer der Gruende, warum fertige Scans frueher weich
-   * und "verschmiert" aussahen. */
   function schaerfeWert(g, w, h) {
     var summe = 0, quad = 0, n = 0;
     for (var y = 2; y < h - 2; y += 2) {
@@ -136,11 +206,6 @@
     return quad / n - m * m;
   }
 
-  /* Bewegung zwischen zwei Frames: mittlerer Helligkeitsunterschied, aber
-   * BELICHTUNGSBEREINIGT (der Mittelwert wird abgezogen) und auf den
-   * Bildkontrast normiert. Ohne das meldete schon eine Helligkeits-
-   * anpassung der Kamera "Bewegung" - und die App sagte wieder
-   * "Ruhig halten", obwohl das Geraet still lag. */
   var letztesGrau = null, letzteGroesse = 0;
   function bewegungWert(g, w, h) {
     var n = w * h, i, summe = 0, quad = 0;
@@ -151,13 +216,13 @@
     if (letztesGrau && letzteGroesse === n) {
       var dSumme = 0;
       for (i = 0; i < n; i++) { dSumme += g[i] - letztesGrau[i]; }
-      var versatz = dSumme / n;                    // Belichtungsaenderung
+      var versatz = dSumme / n;
       var abw = 0;
       for (i = 0; i < n; i++) {
         var d = g[i] - letztesGrau[i] - versatz;
         abw += d < 0 ? -d : d;
       }
-      bew = (abw / n) / streuung;                  // 0 = still
+      bew = (abw / n) / streuung;
     }
     if (!letztesGrau || letzteGroesse !== n) { letztesGrau = new Float32Array(n); }
     letztesGrau.set(g);
@@ -165,13 +230,28 @@
     return bew;
   }
 
-  /* Arbeitsbild bauen (Grau + Gradienten + Kennzahlen) */
+  /* Arbeitsbild bauen (Grau + Gradienten + Kennzahlen + Textur + Satt) */
   function arbeitsbild(rgba, w, h, maxKante, glaetten, masse) {
     var b = graubild(rgba, w, h, maxKante);
     if (masse) {
       b.schaerfe = schaerfeWert(b.g, b.w, b.h);
       b.bewegung = bewegungWert(b.g, b.w, b.h);
     }
+    // Kontrast vor dem Weichzeichnen messen (auf Roh-Grau)
+    var km = kontrastMasse(b.g, b.w, b.h);
+    b.kontrastStd = km.std;
+    b.kontrastMittel = km.mittel;
+
+    // Textur auf Roh-Grau (vor Glaetten) fuer bessere Trennung
+    var tex = texturKarte(b.g, b.w, b.h);
+    b.texturVari = tex.vari;
+    b.texturMean = tex.mean;
+
+    // Saettigung
+    try {
+      b.satt = sattBild(rgba, w, h, maxKante, { xi: b.xi, yi: b.yi });
+    } catch (e) { b.satt = new Float32Array(b.w * b.h); }
+
     b.g = weich(b.g, b.w, b.h, glaetten === undefined ? 2 : glaetten);
     var gr = gradienten(b.g, b.w, b.h);
     b.gx = gr.gx; b.gy = gr.gy; b.mag = gr.mag;
@@ -179,7 +259,6 @@
     return b;
   }
 
-  /* bilineares Abtasten (Grauwert) */
   function grauAn(b, x, y) {
     if (x < 0) { x = 0; } if (y < 0) { y = 0; }
     if (x > b.w - 1.001) { x = b.w - 1.001; }
@@ -190,7 +269,6 @@
     return o + (u - o) * fy;
   }
 
-  /* gerichteter Gradient (Projektion auf die Normale nx,ny), bilinear */
   function gradAn(b, x, y, nx, ny) {
     if (x < 1 || y < 1 || x > b.w - 2.001 || y > b.h - 2.001) { return 0; }
     var x0 = x | 0, y0 = y | 0, fx = x - x0, fy = y - y0, i = y0 * b.w + x0;
@@ -201,17 +279,22 @@
     return gxv * nx + gyv * ny;
   }
 
+  function texturAn(b, x, y) {
+    if (!b.texturVari) { return 0; }
+    if (x < 0) { x = 0; } if (y < 0) { y = 0; }
+    if (x > b.w - 1.001) { x = b.w - 1.001; }
+    if (y > b.h - 1.001) { y = b.h - 1.001; }
+    var x0 = x | 0, y0 = y | 0, fx = x - x0, fy = y - y0, i = y0 * b.w + x0;
+    var o = b.texturVari[i] + (b.texturVari[i + 1] - b.texturVari[i]) * fx;
+    var u = b.texturVari[i + b.w] + (b.texturVari[i + b.w + 1] - b.texturVari[i + b.w]) * fx;
+    return o + (u - o) * fy;
+  }
+
   /* ============= 4. Kantenpunkte (mit Non-Max-Suppression) ======== */
-  var GEWICHT_DECKEL = 28;   // siehe unten
+  var GEWICHT_DECKEL = 28;
 
   function kantenPunkte(b, maxPunkte) {
     var w = b.w, h = b.h, mag = b.mag, gx = b.gx, gy = b.gy;
-    /* Schwelle aus dem Histogramm, aber NIEDRIG gedeckelt.
-     *
-     * Wichtig: Text auf Papier liefert Gradienten von 100+, die Papierkante
-     * auf einem hellen Tisch nur 15-25. Eine Schwelle "staerkste 8 %" liegt
-     * dann weit ueber der Dokumentkante - genau deshalb wurde Papier auf
-     * hellem Untergrund frueher gar nicht gefunden. */
     var hist = new Int32Array(257), i, m;
     for (i = 0; i < mag.length; i++) {
       m = mag[i] | 0; if (m > 256) { m = 256; }
@@ -219,12 +302,20 @@
     }
     var ziel = Math.round(mag.length * 0.10), sum = 0, schwelle = 256;
     for (i = 256; i >= 0; i--) { sum += hist[i]; if (sum >= ziel) { schwelle = i; break; } }
-    if (schwelle < 2.5) { schwelle = 2.5; }
-    if (schwelle > 14) { schwelle = 14; }
 
-    /* 1. Durchgang: zaehlen, 2. Durchgang: gleichmaessig ausduennen.
-     * (Frueher wurde bei Erreichen der Obergrenze abgebrochen - dann kamen
-     * alle Punkte aus der oberen Bildhaelfte.) */
+    // Kontrast-adaptiv: bei niedrigem Kontrast (weiss auf weiss) Schwelle senken
+    var kontrastStd = b.kontrastStd || 20;
+    var minSchwelle = 2.5, maxSchwelle = 14;
+    if (kontrastStd < 12) {
+      minSchwelle = 0.9;
+      maxSchwelle = 8;
+    } else if (kontrastStd < 18) {
+      minSchwelle = 1.4;
+      maxSchwelle = 10;
+    }
+    if (schwelle < minSchwelle) { schwelle = minSchwelle; }
+    if (schwelle > maxSchwelle) { schwelle = maxSchwelle; }
+
     var treffer = new Int32Array(w * h);
     var n = 0, x, y, k, ax, ay, dx, dy;
     for (y = 2; y < h - 2; y++) {
@@ -233,6 +324,14 @@
         k = z + x;
         m = mag[k];
         if (m < schwelle) { continue; }
+        // Textur-Boost: wenn an dieser Stelle Textur stark wechselt, ist es eher Papierkante
+        if (b.texturVari) {
+          var tv = b.texturVari[k];
+          // Fabric hat hohe Varianz (5-15), Papier glatt (0.5-3) aber Text hat mittlere.
+          // Wir wollen Kanten wo Textur innen niedrig und aussen hoch oder umgekehrt.
+          // Einfach: wenn Varianz sehr hoch (>8) und Gradient klein, ist es eher Fabric-Rauschen -> abwerten
+          if (tv > 12 && m < 6) { continue; }
+        }
         ax = gx[k]; ay = gy[k];
         dx = Math.abs(ax) > Math.abs(ay) ? (ax > 0 ? 1 : -1) : 0;
         dy = Math.abs(ay) >= Math.abs(ax) ? (ay > 0 ? 1 : -1) : 0;
@@ -253,15 +352,11 @@
       k = treffer[i];
       xs[j] = k % w; ys[j] = (k / w) | 0;
       gxs[j] = gx[k]; gys[j] = gy[k];
-      /* Gewicht deckeln: sonst erschlagen schwarze Buchstaben (Gradient
-       * 100-200) jede Papierkante (Gradient 15-40) in der Hough-Abstimmung.
-       * Mit Deckel zaehlt vor allem die LAENGE einer Linie - und das ist
-       * genau das Merkmal einer Dokumentkante. */
       ws[j] = mag[k] > GEWICHT_DECKEL ? GEWICHT_DECKEL : mag[k];
       j++;
     }
     return { xs: xs, ys: ys, gxs: gxs, gys: gys, ws: ws, n: j,
-             schwelle: schwelle, roh: n };
+             schwelle: schwelle, roh: n, kontrastStd: kontrastStd };
   }
 
   /* ============ 5. Hough-Transformation (orientierungsgefuehrt) === */
@@ -273,7 +368,7 @@
       COS[i] = Math.cos(t); SIN[i] = Math.sin(t);
     }
   })();
-  var STREU = [0.32, 0.72, 1.0, 0.72, 0.32];   // Streuung ueber +-2 Grad
+  var STREU = [0.32, 0.72, 1.0, 0.72, 0.32];
 
   function houghLinien(b, pkte, maxLinien) {
     var cx = b.w / 2, cy = b.h / 2;
@@ -298,7 +393,6 @@
         acc[basis + 1] += gg * fr;
       }
     }
-    /* leichtes Glaetten in Rho-Richtung: Peaks werden stabiler */
     var tmp = new Float32Array(rhoBins);
     for (bin = 0; bin < WINKEL_BINS; bin++) {
       var o = bin * rhoBins;
@@ -308,11 +402,13 @@
       }
       for (i = 0; i < rhoBins; i++) { acc[o + i] = tmp[i] * 0.25; }
     }
-    /* lokale Maxima einsammeln */
     var max = 0;
     for (i = 0; i < acc.length; i++) { if (acc[i] > max) { max = acc[i]; } }
     if (max <= 0) { return []; }
     var grenze = 0.14 * max;
+    // Bei niedrigem Kontrast: niedrigere Grenze, damit schwache Linien durchkommen
+    if (b.kontrastStd && b.kontrastStd < 14) { grenze = 0.08 * max; }
+    else if (b.kontrastStd && b.kontrastStd < 20) { grenze = 0.11 * max; }
     var roh = [];
     for (bin = 0; bin < WINKEL_BINS; bin++) {
       var ob = bin * rhoBins;
@@ -334,8 +430,6 @@
       var k = roh[i];
       var t = k.bin * Math.PI / WINKEL_BINS;
       var lpx = cx + k.rho * COS[k.bin], lpy = cy + k.rho * SIN[k.bin];
-      /* r ist IMMER der Abstand zum Bildursprung (0,0) - nur so passen
-       * Schnittpunkte ohne Umrechnung zu allen anderen Koordinaten. */
       var lin = {
         t: t, c: COS[k.bin], s: SIN[k.bin],
         r: lpx * COS[k.bin] + lpy * SIN[k.bin], wert: k.wert,
@@ -356,7 +450,6 @@
     return Math.abs(dx * b.c + dy * b.s) < 0.035 * diag;
   }
 
-  /* Bildrand als moegliche Dokumentkante (Dokument groesser als Sucher) */
   function randLinien(b) {
     var cx = b.w / 2, cy = b.h / 2, e = 1.0;
     function mach(px, py, t) {
@@ -368,7 +461,6 @@
             mach(cx, e, Math.PI / 2), mach(cx, b.h - 1 - e, Math.PI / 2)];
   }
 
-  /* Linie auf das Bildrechteck beschneiden -> Strecke */
   function strecke(b, lin) {
     var dx = -lin.s, dy = lin.c;
     var t0 = -1e9, t1 = 1e9;
@@ -387,7 +479,6 @@
             [lin.px + t1 * dx, lin.py + t1 * dy]];
   }
 
-  /* Wie gut wird eine Linie vom Bild gestuetzt? (einmal pro Linie) */
   function linienStuetze(b, lin) {
     if (lin.rand) { lin.stuetze = 3; lin.abdeckung = 1; return; }
     var st = strecke(b, lin);
@@ -396,11 +487,14 @@
     var len = Math.hypot(c[0] - a[0], c[1] - a[1]);
     var n = Math.max(12, Math.min(80, Math.round(len / 3)));
     var summe = 0, treffer = 0;
+    var schwelle = 4;
+    if (b.kontrastStd && b.kontrastStd < 14) { schwelle = 1.2; }
+    else if (b.kontrastStd && b.kontrastStd < 20) { schwelle = 2.2; }
     for (var i = 0; i < n; i++) {
       var t = i / (n - 1);
       var v = Math.abs(gradAn(b, a[0] + (c[0] - a[0]) * t, a[1] + (c[1] - a[1]) * t, lin.c, lin.s));
       summe += v;
-      if (v > 4) { treffer++; }
+      if (v > schwelle) { treffer++; }
     }
     lin.stuetze = summe / n;
     lin.abdeckung = treffer / n;
@@ -421,7 +515,6 @@
     var mit = p.slice().sort(function (a, b) {
       return Math.atan2(a[1] - my, a[0] - mx) - Math.atan2(b[1] - my, b[0] - mx);
     });
-    /* Start bei der Ecke oben links (kleinste Summe) */
     var beste = 0, best = 1e18;
     for (i = 0; i < 4; i++) {
       var v = mit[i][0] + mit[i][1];
@@ -461,7 +554,6 @@
     if (!konvex(q)) { return false; }
     var fl = flaeche(q) / (b.w * b.h);
     if (fl < minFlaeche || fl > 1.25) { return false; }
-    /* Innenwinkel plausibel? */
     for (i = 0; i < 4; i++) {
       var a = q[(i + 3) % 4], m = q[i], c = q[(i + 1) % 4];
       var v1x = a[0] - m[0], v1y = a[1] - m[1];
@@ -469,9 +561,8 @@
       var n1 = Math.hypot(v1x, v1y), n2 = Math.hypot(v2x, v2y);
       if (n1 < 0.06 * b.diag || n2 < 0.06 * b.diag) { return false; }
       var cosw = (v1x * v2x + v1y * v2y) / (n1 * n2);
-      if (cosw > 0.57 || cosw < -0.57) { return false; }   // ca. 55..125 Grad
+      if (cosw > 0.57 || cosw < -0.57) { return false; }
     }
-    /* gegenueberliegende Seiten duerfen sich nicht extrem unterscheiden */
     var l = [];
     for (i = 0; i < 4; i++) {
       l.push(Math.hypot(q[(i + 1) % 4][0] - q[i][0], q[(i + 1) % 4][1] - q[i][1]));
@@ -482,11 +573,9 @@
   }
 
   /* ================== 7. Bewertung eines Vierecks ================= */
-  /* mitte = Schwerpunkt des Vierecks; damit zeigt die Normale IMMER nach
-   * aussen und "pol > 0" heisst eindeutig: innen heller als aussen. */
   function seiteMessen(b, a, c, mitte) {
     var L = Math.hypot(c[0] - a[0], c[1] - a[1]);
-    if (L < 6) { return { stuetze: 0, abdeckung: 0, pol: 0, kontrast: 0, fort: 0 }; }
+    if (L < 6) { return { stuetze: 0, abdeckung: 0, pol: 0, kontrast: 0, fort: 0, textur: 0 }; }
     var dx = (c[0] - a[0]) / L, dy = (c[1] - a[1]) / L;
     var nx = -dy, ny = dx;
     if (mitte) {
@@ -496,36 +585,37 @@
     var n = Math.max(14, Math.min(64, Math.round(L / 4)));
     var abstand = Math.max(2.5, 0.012 * b.diag);
     var summe = 0, treffer = 0, polSum = 0, kontrast = 0, gueltig = 0, stufe = 0;
+    var texturDiff = 0, texturN = 0;
+    var gradSchw = 4;
+    if (b.kontrastStd && b.kontrastStd < 14) { gradSchw = 1.2; }
+    else if (b.kontrastStd && b.kontrastStd < 20) { gradSchw = 2.2; }
     for (var i = 0; i < n; i++) {
       var t = 0.05 + 0.9 * (i / (n - 1));
       var px = a[0] + (c[0] - a[0]) * t, py = a[1] + (c[1] - a[1]) * t;
-      /* beste Kantenantwort in einem schmalen Band (+-1.5 px) - die
-       * Kandidatenkante liegt selten exakt auf dem Pixelraster */
       var best = 0;
       for (var s = -1.5; s <= 1.51; s += 0.75) {
         var v = Math.abs(gradAn(b, px + s * nx, py + s * ny, nx, ny));
         if (v > best) { best = v; }
       }
       summe += best;
-      if (best > 4) { treffer++; }
+      if (best > gradSchw) { treffer++; }
       var innen = grauAn(b, px - abstand * nx, py - abstand * ny);
       var aussen = grauAn(b, px + abstand * nx, py + abstand * ny);
       polSum += (innen - aussen) > 0 ? 1 : -1;
       kontrast += Math.abs(innen - aussen);
-      /* STUFE statt STRICH: an einer echten Dokumentkante bleibt es
-       * draussen anders hell - auch ein Stueck weiter weg. Ein dunkler
-       * Strich (Tischkante, Lineal, Unterstreichung) sieht nur direkt
-       * daneben anders aus und geht danach wieder in den Hintergrund
-       * ueber. Dieser Test wirft solche Stoerlinien zuverlaessig raus. */
       var fern = grauAn(b, px + 2.8 * abstand * nx, py + 2.8 * abstand * ny);
       var nah = Math.abs(innen - aussen);
       var weit = Math.abs(innen - fern);
       var gleich = ((innen - aussen) > 0) === ((innen - fern) > 0);
       stufe += gleich ? Math.min(1.15, weit / (nah + 1.5)) : 0;
       gueltig++;
+      if (b.texturVari) {
+        var ti = texturAn(b, px - abstand * nx, py - abstand * ny);
+        var ta = texturAn(b, px + abstand * nx, py + abstand * ny);
+        texturDiff += Math.abs(ti - ta);
+        texturN++;
+      }
     }
-    /* Fortsetzungstest: laeuft die Kante ueber die Ecken hinaus weiter?
-     * Dann ist es eher eine durchgehende Linie (Tischkante, Schatten). */
     var fort = 0, fn = 0;
     for (var e = 0; e < 2; e++) {
       for (var j = 1; j <= 6; j++) {
@@ -541,7 +631,8 @@
       pol: polSum / Math.max(1, gueltig),
       kontrast: kontrast / Math.max(1, gueltig),
       stufe: stufe / Math.max(1, gueltig),
-      fort: fn ? fort / fn : 0
+      fort: fn ? fort / fn : 0,
+      textur: texturN ? texturDiff / texturN : 0
     };
   }
 
@@ -550,57 +641,125 @@
             (q[0][1] + q[1][1] + q[2][1] + q[3][1]) / 4];
   }
 
+  // Textdichte: Anteil Kantenpunkte innerhalb Viereck
+  function textDichte(b, q) {
+    if (!b.pkte || !b.pkte.n) { return 0.5; }
+    var pkte = b.pkte;
+    var count = 0, inside = 0;
+    // Bounding box fuer schnellen Test
+    var minX = Math.min(q[0][0], q[1][0], q[2][0], q[3][0]);
+    var maxX = Math.max(q[0][0], q[1][0], q[2][0], q[3][0]);
+    var minY = Math.min(q[0][1], q[1][1], q[2][1], q[3][1]);
+    var maxY = Math.max(q[0][1], q[1][1], q[2][1], q[3][1]);
+    for (var i = 0; i < pkte.n; i++) {
+      var x = pkte.xs[i], y = pkte.ys[i];
+      if (x < minX || x > maxX || y < minY || y > maxY) { continue; }
+      if (punktInnen(q, [x, y])) {
+        inside++;
+      }
+    }
+    var area = flaeche(q);
+    if (area < 1) { return 0; }
+    // Dichte pro Flaeche, normiert
+    return inside / Math.sqrt(area);
+  }
+
   function bewerte(b, q, randSeiten) {
     var mitte = schwerpunkt(q), i;
     var seiten = [];
     var geo = 0, abd = 0, polGew = 0, polSumme = 0, kon = 0, strafe = 1;
+    var texturSum = 0;
+    var kontrastStd = b.kontrastStd || 20;
     for (i = 0; i < 4; i++) {
       var a = q[i], c = q[(i + 1) % 4];
       var m = seiteMessen(b, a, c, mitte);
       seiten.push(m);
       var s = m.stuetze * (0.35 + 0.65 * m.abdeckung) *
               (m.kontrast < 3 ? 0.9 : (0.4 + 0.6 * Math.min(1, m.stufe)));
-      /* Eine Seite, die auf dem Bildrand liegt, ist nur ein NOTBEHELF
-       * (Dokument groesser als der Sucher). Sie bekommt eine feste,
-       * niedrige Stuetze und einen Abschlag, damit eine echte, erkannte
-       * Blattkante immer gewinnt. */
-      if (randSeiten && randSeiten[i]) { s = 3.0; strafe *= 0.6; }
-      else if (m.fort > Math.max(5, 0.75 * m.stuetze)) { strafe *= 0.55; }
+      // Textur-Bonus: Kante wo Textur wechselt ist wahrscheinlicher Papierkante
+      // Bei niedrigem Kontrast (weiss auf weiss) Textur viel staerker gewichten
+      if (m.textur > 0.5) {
+        if (kontrastStd < 14) {
+          s *= (1 + 0.55 * Math.min(1, m.textur / 2.5));
+        } else if (kontrastStd < 20) {
+          s *= (1 + 0.32 * Math.min(1, m.textur / 3));
+        } else {
+          s *= (1 + 0.15 * Math.min(1, m.textur / 3));
+        }
+      } else if (kontrastStd < 12 && m.textur > 0.25) {
+        // Auch kleine Textur-Unterschiede belohnen bei sehr niedrigem Kontrast
+        s *= (1 + 0.18 * m.textur);
+      }
+      if (randSeiten && randSeiten[i]) {
+        // Bei niedrigem Kontrast Rand-Seiten weniger stark bestrafen? Nein,
+        // Rand bleibt schlecht, aber bei weiss-auf-weiss ist oft nur Rand verfuegbar
+        if (kontrastStd < 14) {
+          s = 4.5; strafe *= 0.75;
+        } else {
+          s = 3.0; strafe *= 0.6;
+        }
+      } else if (m.fort > Math.max(5, 0.75 * m.stuetze)) {
+        // Fortsetzung hinter Kante: bei niedrigem Kontrast weniger streng
+        if (kontrastStd < 14) { strafe *= 0.75; }
+        else { strafe *= 0.55; }
+      }
       geo += Math.log(Math.max(s, 0.25));
       abd += m.abdeckung / 4;
-      /* Polaritaet KONTRASTGEWICHTET: eine Seite mit kaum Helligkeits-
-       * unterschied (z.B. Blattkante im Schatten) darf das Urteil ueber
-       * die anderen drei nicht kippen. */
       polSumme += m.pol * m.kontrast;
       polGew += m.kontrast;
       kon += m.kontrast / 4;
+      texturSum += m.textur / 4;
     }
     geo = Math.exp(geo / 4);
     var pol = polGew > 1e-6 ? polSumme / polGew : 0;
     var fl = flaeche(q) / (b.w * b.h);
-    /* Polaritaet: alle vier Seiten sollen gleich herum sein.
-     * Eine echte Blattkante ist auf ALLEN Seiten gleich gepolt (innen
-     * heller als aussen bzw. umgekehrt). Die Kante eines Textblocks ist
-     * das nicht - das ist das zuverlaessigste Unterscheidungsmerkmal. */
     var einigkeit = Math.abs(pol);
-    var polBonus = kon < 2.0 ? 0.6 : (0.3 + 0.7 * einigkeit);
-    /* Mitte: Dokumente liegen normalerweise mittig im Sucher */
+    var polBonus;
+    if (kontrastStd < 14) {
+      // Bei sehr niedrigem Kontrast Polaritaet weniger wichtig
+      polBonus = kon < 1.0 ? 0.75 : (0.55 + 0.45 * einigkeit);
+    } else {
+      polBonus = kon < 2.0 ? 0.6 : (0.3 + 0.7 * einigkeit);
+    }
     var ab = Math.hypot(mitte[0] - b.w / 2, mitte[1] - b.h / 2) / (b.diag / 2);
     var mitteBonus = 1 - 0.3 * Math.min(1, ab);
-    /* Flaeche geht LINEAR ein: lieber das ganze Blatt als der Textblock
-     * darin. Mit Wurzel gewann regelmaessig der (kontrastreichere) innere
-     * Textblock - eine der Hauptursachen fuer "verrutschte" Scans. */
-    var wert = geo * fl * polBonus * mitteBonus * strafe;
+    // Bei niedrigem Kontrast Mitte-Bonus reduzieren (Papier liegt oft nicht mittig bei weiss-auf-weiss)
+    if (kontrastStd < 14) { mitteBonus = 1 - 0.18 * Math.min(1, ab); }
+
+    // Textdichte-Bonus: innen sollte mehr Text sein als aussen
+    var dichte = textDichte(b, q);
+    var dichteBonus = 0.8 + 0.4 * Math.min(1, dichte / 2.5);
+    if (kontrastStd < 14) {
+      // Bei niedrigem Kontrast Dichte noch wichtiger (Top-Blatt hat Text)
+      dichteBonus = 0.7 + 0.65 * Math.min(1, dichte / 2.0);
+    }
+    // Bei sehr niedriger Dichte (nur Hintergrund) abwerten
+    if (dichte < 0.15) { dichteBonus *= 0.6; }
+
+    var wert = geo * fl * polBonus * mitteBonus * strafe * dichteBonus;
+    // Textur-Bonus global: wenn Texturunterschied an Kanten hoch, belohnen
+    if (texturSum > 0.8) {
+      wert *= kontrastStd < 14 ? 1.22 : (kontrastStd < 20 ? 1.14 : 1.08);
+    } else if (kontrastStd < 14 && texturSum > 0.4) {
+      wert *= 1.10;
+    }
+
+    var konfBasis = (geo / 13) * (0.3 + 0.7 * abd) *
+                    (0.45 + 0.55 * einigkeit) * dichteBonus;
+    // Bei niedrigem Kontrast Konfidenz etwas anheben wenn Textur hoch
+    if (kontrastStd < 14 && texturSum > 0.6) {
+      konfBasis *= 1.25;
+    }
     return {
       wert: wert, geo: geo, abdeckung: abd, polaritaet: einigkeit,
       kontrast: kon, flaeche: fl, seiten: seiten,
-      konfidenz: klemme((geo / 13) * (0.3 + 0.7 * abd) *
-                        (0.45 + 0.55 * einigkeit), 0, 1)
+      textur: texturSum, dichte: dichte,
+      konfidenz: klemme(konfBasis, 0, 1)
     };
   }
 
   /* ========== 8. Kanten subpixelgenau nachziehen ================== */
-  function gerade(punkte) {        // Total-Least-Squares durch Punktwolke
+  function gerade(punkte) {
     var n = punkte.length, mx = 0, my = 0, i;
     for (i = 0; i < n; i++) { mx += punkte[i][0]; my += punkte[i][1]; }
     mx /= n; my /= n;
@@ -609,7 +768,7 @@
       var dx = punkte[i][0] - mx, dy = punkte[i][1] - my;
       sxx += dx * dx; syy += dy * dy; sxy += dx * dy;
     }
-    var theta = 0.5 * Math.atan2(2 * sxy, sxx - syy);   // Hauptachse
+    var theta = 0.5 * Math.atan2(2 * sxy, sxx - syy);
     var dxr = Math.cos(theta), dyr = Math.sin(theta);
     return { px: mx, py: my, dx: dxr, dy: dyr, c: -dyr, s: dxr,
              r: mx * (-dyr) + my * dxr };
@@ -630,25 +789,20 @@
       var t = 0.04 + 0.92 * (i / (n - 1));
       var px = a[0] + (c[0] - a[0]) * t, py = a[1] + (c[1] - a[1]) * t;
       var bestS = null, bestV = 0;
-      /* Erwartung: ist innen heller (pol > 0), faellt die Helligkeit nach
-       * aussen - der Gradient entlang der Aussennormalen ist negativ.
-       * Kanten mit falscher Polaritaet (z.B. eine Textzeile knapp daneben)
-       * werden stark abgewertet statt gleichberechtigt mitzuspielen. */
       for (var s = -suchweite; s <= suchweite + 0.001; s += 0.5) {
         var g = gradAn(b, px + s * nx, py + s * ny, nx, ny);
         var passt = polaritaet === 0 || (polaritaet > 0 ? g < 0 : g > 0);
         var v = Math.abs(g) * (passt ? 1 : 0.3);
-        /* leichte Bevorzugung der Naehe zur Ausgangskante */
         v *= 1 - 0.25 * Math.abs(s) / (suchweite + 1e-6);
         if (v > bestV) { bestV = v; bestS = s; }
       }
-      if (bestS !== null && bestV > 3) {
+      if (bestS !== null && bestV > 2) {
         punkte.push([px + bestS * nx, py + bestS * ny]);
       }
     }
     if (punkte.length < 8) { return null; }
     var lin = gerade(punkte);
-    for (var k = 0; k < 3; k++) {                 // Ausreisser rauswerfen
+    for (var k = 0; k < 3; k++) {
       var dist = [], j;
       for (j = 0; j < punkte.length; j++) {
         dist.push(Math.abs((punkte[j][0] - lin.px) * lin.c +
@@ -682,11 +836,10 @@
       var l1 = linien[(i + 3) % 4], l2 = linien[i];
       if (!l1 || !l2) { neu.push(q[i]); continue; }
       if (winkelAbstand(Math.atan2(l1.dy, l1.dx), Math.atan2(l2.dy, l2.dx)) < 0.25) {
-        neu.push(q[i]); continue;           // zu parallel -> Schnitt unsicher
+        neu.push(q[i]); continue;
       }
       var p = schnitt(l1, l2);
       if (!p) { neu.push(q[i]); continue; }
-      /* Sicherheitsnetz: die neue Ecke darf nicht weit weglaufen */
       if (Math.hypot(p[0] - q[i][0], p[1] - q[i][1]) > 1.6 * suchweite + 3) {
         neu.push(q[i]); continue;
       }
@@ -718,8 +871,37 @@
     return schwelle;
   }
 
+  function otsuFloat(arr) {
+    // Otsu fuer Float-Array (0..max), fuer Textur/Satt
+    var n = arr.length;
+    if (!n) { return 0; }
+    var min = arr[0], max = arr[0];
+    for (var i = 1; i < n; i++) { if (arr[i] < min) { min = arr[i]; } if (arr[i] > max) { max = arr[i]; } }
+    if (max - min < 1e-6) { return min; }
+    var hist = new Int32Array(256);
+    var scale = 255 / (max - min);
+    for (var j = 0; j < n; j++) {
+      var v = ((arr[j] - min) * scale) | 0;
+      if (v < 0) { v = 0; } if (v > 255) { v = 255; }
+      hist[v]++;
+    }
+    var gesamt = n, summe = 0;
+    for (var k = 0; k < 256; k++) { summe += k * hist[k]; }
+    var sumB = 0, wB = 0, best = 0, schwelle = 128;
+    for (var k = 0; k < 256; k++) {
+      wB += hist[k];
+      if (!wB) { continue; }
+      var wF = gesamt - wB;
+      if (!wF) { break; }
+      sumB += k * hist[k];
+      var mB = sumB / wB, mF = (summe - sumB) / wF;
+      var zw = wB * wF * (mB - mF) * (mB - mF);
+      if (zw > best) { best = zw; schwelle = k; }
+    }
+    return min + schwelle / scale;
+  }
+
   function maskeKomponente(maske, w, h) {
-    /* groesste 8-verbundene Komponente (Zwei-Pass mit Union-Find) */
     var lab = new Int32Array(w * h);
     var eltern = [0];
     function finde(a) { while (eltern[a] !== a) { a = eltern[a] = eltern[eltern[a]]; } return a; }
@@ -794,7 +976,7 @@
   function groesstesViereck(h) {
     var n = h.length;
     if (n < 4) { return null; }
-    if (n > 48) {                                  // ausduennen
+    if (n > 48) {
       var step = n / 48, neu = [];
       for (var i = 0; i < 48; i++) { neu.push(h[Math.floor(i * step)]); }
       h = neu; n = 48;
@@ -867,9 +1049,6 @@
     return a;
   }
 
-  /* Halbe Aufloesung reicht: das Ergebnis ist ein GROBER Kandidat, der
-   * anschliessend sowieso subpixelgenau nachgezogen wird. Spart 75 % der
-   * Rechenzeit des Fallbacks. */
   function halbieren(b) {
     var w = b.w >> 1, h = b.h >> 1;
     var g = new Float32Array(w * h);
@@ -883,36 +1062,10 @@
     return { g: g, w: w, h: h };
   }
 
-  /* ---------------------------------------------------------------------
-   * Beleuchtungs-normalisiertes Graubild.
-   *
-   * WARUM DAS DER WICHTIGSTE SCHRITT FUER "WEISS AUF WEISS" IST
-   * -----------------------------------------------------------
-   * Ein weisses Blatt auf weisser Decke unterscheidet sich vom Untergrund
-   * fast nur durch seinen SCHATTEN - also durch eine Helligkeitsaenderung
-   * von wenigen Prozent. Genau die verschwindet, wenn irgendwo im Bild
-   * eine Lampe, ein Blitz oder eine Vignette liegt: dort ist das Bild
-   * ohnehin heller oder dunkler.
-   *
-   * Teilt man dagegen jeden Pixel durch die GROB GEGLAETTETE Helligkeit
-   * seiner Umgebung ("Beleuchtungsfeld"), bleibt vom Licht nur noch das
-   * Verhaeltnis Papier/Untergrund uebrig. Der Schattenrand ist danach
-   * genauso stark wie auf einem perfekt ausgeleuchteten Foto - und eine
-   * harte Schattengrenze quer ueber das Blatt verschwindet, weil sie im
-   * Feld mitgelernt wird. Ein weisses Blatt auf weisser Unterlage wird
-   * dadurch zu einer fast gleichmaessig hellen Flaeche, die die
-   * Flaechen-Suche sauber als groesste Komponente findet.
-   *
-   * Das Feld wird absichtlich nur grob geschaetzt (grosser Kasten,
-   * zweimal), damit Textzeilen und Blattkante NICHT hineingerechnet
-   * werden - sonst wuerde die Normalisierung genau die Kanten
-   * wegdruecken, die wir suchen.
-   * ------------------------------------------------------------------- */
   function beleuchtungsfeldNetz(g, w, h) {
     var r = Math.max(3, Math.round(0.06 * Math.max(w, h)));
     var a = g, b = new Float32Array(w * h), x, y, summe = 0;
     for (var d = 0; d < 2; d++) {
-      /* waagerecht: gleitende Summe ueber 2r+1 Pixel */
       for (y = 0; y < h; y++) {
         var z = y * w, s = 0, n = 0;
         for (x = -r; x <= r; x++) {
@@ -926,7 +1079,6 @@
           if (rein < w) { s += a[z + rein]; }
         }
       }
-      /* senkrecht */
       for (x = 0; x < w; x++) {
         var t = 0, m = 0;
         for (y = -r; y <= r; y++) {
@@ -940,16 +1092,11 @@
           if (ri < h) { t += b[ri * w + x]; }
         }
       }
-      /* Ergebnis steht jetzt in a (waagerecht nach b, senkrecht zurueck
-       * nach a). Beim naechsten Durchgang wird b ohnehin vollstaendig
-       * ueberschrieben. */
     }
     for (var i = 0; i < w * h; i++) { summe += a[i]; }
     var mittel = summe / (w * h);
     var out = new Float32Array(w * h);
     for (var k = 0; k < w * h; k++) {
-      /* Verhaeltnis zum Umgebungslicht, begrenzt: eine echte dunkle
-       * Flaeche soll nicht ins Unendliche aufgehellt werden. */
       var f = mittel / Math.max(a[k], 1.0);
       if (f > 2.4) { f = 2.4; } else if (f < 0.45) { f = 0.45; }
       out[k] = Math.min(255, g[k] * f);
@@ -957,8 +1104,6 @@
     return out;
   }
 
-  /* Flaechen-Kandidaten aus einem Graubild: Otsu-Maske in beide
-   * Richtungen -> groesste Komponente -> konvexe Huelle -> Viereck. */
   function viereckeAusGrau(g, w, h, maxVierecke) {
     var out = [];
     var schwelle = otsu({ g: g, w: w, h: h });
@@ -971,7 +1116,86 @@
       }
       var anteil = an / (w * h);
       if (anteil < 0.04 || anteil > 0.97) { continue; }
-      /* Schliessen: Textloecher zu, danach oeffnen: duenne Bruecken weg */
+      maske = erodieren(dilatieren(maske, w, h, 1), w, h, 1);
+      var komp = maskeKomponente(maske, w, h);
+      if (!komp || komp.groesse < 0.05 * w * h) { continue; }
+      var hu = huelle(komp.punkte);
+      var vier = groesstesViereck(hu);
+      if (vier) {
+        out.push(vier.map(function (p) { return [p[0] * 2 + 0.5, p[1] * 2 + 0.5]; }));
+        if (maxVierecke && out.length >= maxVierecke) { return out; }
+      }
+    }
+    return out;
+  }
+
+  // Textur-basierte Kandidaten: glatte Flaeche (Papier) vs raue (Decke)
+  function viereckeAusTextur(vari, w, h, maxVierecke) {
+    var out = [];
+    var schwelle = otsuFloat(vari);
+    // Papier hat niedrige Varianz (glatt) im Vergleich zu Decke (hoch)
+    // Aber Text erhoeht Varianz lokal - deshalb Schwelle etwas hoeher und
+    // staerkere Morphologie um Textloecher zu schliessen.
+    for (var modus = 0; modus < 2; modus++) {
+      var maske = new Uint8Array(w * h), an = 0;
+      for (var i = 0; i < w * h; i++) {
+        var glatt = vari[i] < schwelle;
+        maske[i] = (modus === 0 ? glatt : !glatt) ? 1 : 0;
+        an += maske[i];
+      }
+      var anteil = an / (w * h);
+      if (anteil < 0.05 || anteil > 0.95) { continue; }
+      // Staerkere Schliessung: 3x dilate, 2x erode fuer Textloecher
+      maske = erodieren(dilatieren(maske, w, h, 3), w, h, 2);
+      var komp = maskeKomponente(maske, w, h);
+      if (!komp || komp.groesse < 0.05 * w * h) { continue; }
+      var hu = huelle(komp.punkte);
+      var vier = groesstesViereck(hu);
+      if (vier) {
+        out.push(vier.map(function (p) { return [p[0] * 2 + 0.5, p[1] * 2 + 0.5]; }));
+        if (maxVierecke && out.length >= maxVierecke) { return out; }
+      }
+    }
+    // Zweiter Versuch mit adaptiver Schwelle (Mittelwert * 0.7) falls Otsu versagt
+    if (out.length === 0) {
+      var sum = 0; for (var i = 0; i < vari.length; i++) { sum += vari[i]; }
+      var avg = sum / vari.length;
+      var schw2 = avg * 0.75;
+      for (var modus2 = 0; modus2 < 2; modus2++) {
+        var maske2 = new Uint8Array(w * h), an2 = 0;
+        for (var j = 0; j < w * h; j++) {
+          var glatt2 = vari[j] < schw2;
+          maske2[j] = (modus2 === 0 ? glatt2 : !glatt2) ? 1 : 0;
+          an2 += maske2[j];
+        }
+        var anteil2 = an2 / (w * h);
+        if (anteil2 < 0.05 || anteil2 > 0.95) { continue; }
+        maske2 = erodieren(dilatieren(maske2, w, h, 3), w, h, 2);
+        var komp2 = maskeKomponente(maske2, w, h);
+        if (!komp2 || komp2.groesse < 0.05 * w * h) { continue; }
+        var hu2 = huelle(komp2.punkte);
+        var vier2 = groesstesViereck(hu2);
+        if (vier2) {
+          out.push(vier2.map(function (p) { return [p[0] * 2 + 0.5, p[1] * 2 + 0.5]; }));
+          if (maxVierecke && out.length >= maxVierecke) { return out; }
+        }
+      }
+    }
+    return out;
+  }
+
+  function viereckeAusSatt(satt, w, h, maxVierecke) {
+    var out = [];
+    var schwelle = otsuFloat(satt);
+    for (var modus = 0; modus < 2; modus++) {
+      var maske = new Uint8Array(w * h), an = 0;
+      for (var i = 0; i < w * h; i++) {
+        var wenig = satt[i] < schwelle;
+        maske[i] = (modus === 0 ? wenig : !wenig) ? 1 : 0;
+        an += maske[i];
+      }
+      var anteil = an / (w * h);
+      if (anteil < 0.05 || anteil > 0.96) { continue; }
       maske = erodieren(dilatieren(maske, w, h, 1), w, h, 1);
       var komp = maskeKomponente(maske, w, h);
       if (!komp || komp.groesse < 0.05 * w * h) { continue; }
@@ -988,18 +1212,42 @@
   function flaechenKandidaten(bGross, auchNormalisiert) {
     var b = halbieren(bGross);
     var out = viereckeAusGrau(b.g, b.w, b.h, 2);
-    if (auchNormalisiert) {
-      /* Dieselbe Suche auf dem beleuchtungs-normalisierten Bild. Nur so
-       * tauchen Blaetter auf, deren Kante im Schatten oder im Blitzlicht
-       * liegt (siehe beleuchtungsfeldNetz). */
-      var gn = beleuchtungsfeldNetz(b.g, b.w, b.h);
-      var weitere = viereckeAusGrau(gn, b.w, b.h, 2);
-      for (var i = 0; i < weitere.length; i++) {
-        var v = weitere[i], doppelt = false;
+
+    // Textur-Kandidaten (NEU: fuer weisse Decke)
+    if (bGross.texturVari) {
+      var bTex = halbieren({ g: bGross.texturVari, w: bGross.w, h: bGross.h });
+      var texK = viereckeAusTextur(bTex.g, bTex.w, bTex.h, 2);
+      for (var i = 0; i < texK.length; i++) {
+        var v = texK[i], doppelt = false;
         for (var j = 0; j < out.length; j++) {
-          if (abstandVierecke(v, out[j]) < 4) { doppelt = true; break; }
+          if (abstandVierecke(v, out[j]) < 6) { doppelt = true; break; }
         }
         if (!doppelt) { out.push(v); }
+      }
+    }
+
+    // Saettigungs-Kandidaten
+    if (bGross.satt) {
+      var bSatt = halbieren({ g: bGross.satt, w: bGross.w, h: bGross.h });
+      var sattK = viereckeAusSatt(bSatt.g, bSatt.w, bSatt.h, 2);
+      for (var ii = 0; ii < sattK.length; ii++) {
+        var vv = sattK[ii], dd = false;
+        for (var jj = 0; jj < out.length; jj++) {
+          if (abstandVierecke(vv, out[jj]) < 6) { dd = true; break; }
+        }
+        if (!dd) { out.push(vv); }
+      }
+    }
+
+    if (auchNormalisiert) {
+      var gn = beleuchtungsfeldNetz(b.g, b.w, b.h);
+      var weitere = viereckeAusGrau(gn, b.w, b.h, 2);
+      for (var k = 0; k < weitere.length; k++) {
+        var wk = weitere[k], dopp = false;
+        for (var l = 0; l < out.length; l++) {
+          if (abstandVierecke(wk, out[l]) < 4) { dopp = true; break; }
+        }
+        if (!dopp) { out.push(wk); }
       }
     }
     return out;
@@ -1014,7 +1262,6 @@
     return m;
   }
 
-  /* Mittlerer Eckabstand zweier gleich sortierter Vierecke. */
   function mittlererAbstand(a, c) {
     var s = 0;
     for (var i = 0; i < 4; i++) {
@@ -1035,6 +1282,13 @@
     return true;
   }
 
+  function quadEnthaelt(aussen, innen) {
+    for (var i = 0; i < 4; i++) {
+      if (!punktInnen(aussen, innen[i])) { return false; }
+    }
+    return true;
+  }
+
   function aussenGewinnt(liste, best) {
     var sieger = best;
     for (var i = 0; i < liste.length; i++) {
@@ -1044,7 +1298,6 @@
       if (k.geo < 0.7 * best.geo) { continue; }
       if (k.abdeckung < 0.9 * best.abdeckung && k.abdeckung < 0.9) { continue; }
       if (k.polaritaet < 0.75 * best.polaritaet && k.polaritaet < 0.8) { continue; }
-      /* jede Seite des aeusseren Kandidaten muss eine echte STUFE sein */
       var schwach = false;
       for (var t = 0; t < 4; t++) {
         if (k.seiten[t].stufe < 0.3 && k.seiten[t].kontrast > 3) { schwach = true; }
@@ -1052,32 +1305,49 @@
       if (schwach) { continue; }
       if (k.randSeiten && k.randSeiten.filter(Boolean).length >
           best.randSeiten.filter(Boolean).length) { continue; }
-      /* der bisherige Sieger muss komplett im Kandidaten liegen
-       * (kleine Toleranz: Ecken duerfen minimal herausragen) */
       var drin = 0;
       for (var e = 0; e < 4; e++) { if (punktInnen(k.q, best.q[e])) { drin++; } }
       if (drin < 4) { continue; }
+      // NEU: Wenn inneres Viereck hoehere Textdichte hat, ist es wahrscheinlich Top-Blatt
+      // Dann soll aeusseres NICHT gewinnen (Stapel-Fall)
+      if (best.dichte && k.dichte && best.dichte > k.dichte * 1.25) { continue; }
       if (k.flaeche > sieger.flaeche) { sieger = k; }
     }
     return sieger;
   }
 
+  /* Stapel-Korrektur: Wenn KI innerhalb klassischem liegt, Top-Blatt bevorzugen */
+  function stapelKorrektur(bewertet, best, kiBester) {
+    if (!kiBester) { return best; }
+    if (!best) { return kiBester; }
+    // KI innerhalb best?
+    if (quadEnthaelt(best.q, kiBester.q)) {
+      var areaRatio = kiBester.flaeche / best.flaeche;
+      if (areaRatio < 0.88 && areaRatio > 0.25) {
+        // Bei Stapel: KI ist Top-Blatt, best ist Stapelkante
+        if (kiBester.kiKonf >= 0.32) {
+          // Zusaetzlich pruefen: hat inneres hoehere Textdichte?
+          if (!best.dichte || !kiBester.dichte || kiBester.dichte >= best.dichte * 0.85) {
+            return kiBester;
+          }
+        }
+      }
+    }
+    // Auch zwischen zwei klassischen: inneres mit hoeherer Dichte gewinnt bei Stapel
+    for (var i = 0; i < bewertet.length; i++) {
+      var k = bewertet[i];
+      if (k === best) { continue; }
+      if (quadEnthaelt(best.q, k.q)) {
+        var ar = k.flaeche / best.flaeche;
+        if (ar < 0.88 && ar > 0.25 && k.dichte > best.dichte * 1.3) {
+          if (k.wert > best.wert * 0.5) { return k; }
+        }
+      }
+    }
+    return best;
+  }
+
   /* ===================== 10. Hauptfunktion ======================== */
-  /*
-   * erkenne(rgba, breite, hoehe, optionen)
-   *   optionen.arbeitsKante : Arbeitsaufloesung (Standard 256)
-   *   optionen.minFlaeche   : Mindestflaeche des Vierecks (0..1, Std 0.06)
-   *   optionen.feinKante    : Aufloesung fuer das Nachziehen (Std 2x Arbeit)
-   *   optionen.randErlaubt  : duerfen Bildraender Kanten sein (Std true)
-   *   optionen.kandidaten   : zusaetzliche Vierecke von aussen, z.B. aus der
-   *                           KI-Erkennung (detect-nn.js). Format je Eintrag:
-   *                           { quad: [[x,y]x4], konfidenz: 0..1 }. Sie
-   *                           laufen durch GENAU dieselbe Bewertung wie die
-   *                           selbst gefundenen Vierecke - es gewinnt also
-   *                           immer das Viereck, das das Bild am besten
-   *                           stuetzt, nicht pauschal "die KI".
-   * Rueckgabe: { quad, konfidenz, wert, flaeche, randSeiten, quelle } | null
-   */
   function erkenne(rgba, breite, hoehe, optionen) {
     optionen = optionen || {};
     var arbeitsKante = optionen.arbeitsKante || 256;
@@ -1090,22 +1360,20 @@
     modul.masse = { schaerfe: b.schaerfe || 0,
                     bewegung: b.bewegung === undefined ? -1 : b.bewegung };
     var pkte = kantenPunkte(b, 9000);
-    var linien = houghLinien(b, pkte, 22);
+    b.pkte = pkte; // fuer Textdichte
+    var linien = houghLinien(b, pkte, 28); // mehr Linien fuer weiss-auf-weiss
     var i, j;
     for (i = 0; i < linien.length; i++) { linienStuetze(b, linien[i]); }
-    linien = linien.filter(function (l) { return l.abdeckung > 0.22 && l.stuetze > 2.2; });
+    // Adaptive Filter fuer niedrigen Kontrast
+    var minAbdeckung = 0.22, minStuetze = 2.2;
+    if (b.kontrastStd < 14) { minAbdeckung = 0.12; minStuetze = 0.9; }
+    else if (b.kontrastStd < 20) { minAbdeckung = 0.16; minStuetze = 1.4; }
+    linien = linien.filter(function (l) { return l.abdeckung > minAbdeckung && l.stuetze > minStuetze; });
     if (randErlaubt) {
       var rl = randLinien(b);
       for (i = 0; i < rl.length; i++) { linienStuetze(b, rl[i]); linien.push(rl[i]); }
     }
 
-    /* Linien in Familien (fast parallel) gruppieren.
-     *
-     * Entscheidend: In jeder Familie werden die beiden AEUSSERSTEN Linien
-     * immer behalten. Eine Dokumentkante ist naemlich immer die aeusserste
-     * Linie ihrer Richtung - die vielen starken Linien dazwischen sind
-     * Textzeilen. Ohne diese Regel verdraengen 10 Textzeilen die echte
-     * Blattkante aus der Auswahl (genau das Problem der alten Erkennung). */
     var familien = [];
     linien.sort(function (p, q) { return q.stuetze - p.stuetze; });
     for (i = 0; i < linien.length; i++) {
@@ -1123,10 +1391,6 @@
     for (var fi = 0; fi < familien.length; fi++) {
       var mit = familien[fi].mitglieder;
       if (mit.length < 2) { continue; }
-      /* nach Lage sortieren, Extreme + Staerkste behalten.
-       * Bildrand-Linien zaehlen NICHT als Extreme - sonst besetzen sie die
-       * beiden Aussenplaetze und verdraengen genau die echten Blattkanten,
-       * um die es geht. */
       var ref = mit[0];
       mit.forEach(function (l) {
         l.lage = (l.px - ref.px) * ref.c + (l.py - ref.py) * ref.s;
@@ -1136,9 +1400,6 @@
       var auswahl = [];
       if (echte.length) {
         var nachLage = echte.slice().sort(function (p, q) { return p.lage - q.lage; });
-        /* die beiden aeussersten UND die zweitaeussersten Linien je Seite:
-         * oft ist die allererste Linie eine Stoerung (Tischkante, Schatten)
-         * und die echte Blattkante liegt direkt dahinter. */
         var kandidatenIdx = [0, 1, nachLage.length - 2, nachLage.length - 1];
         for (j = 0; j < kandidatenIdx.length; j++) {
           var ix = kandidatenIdx[j];
@@ -1147,7 +1408,7 @@
           }
         }
       }
-      for (j = 0; j < echte.length && auswahl.length < 8; j++) {
+      for (j = 0; j < echte.length && auswahl.length < 10; j++) {
         if (auswahl.indexOf(echte[j]) < 0) { auswahl.push(echte[j]); }
       }
       auswahl = auswahl.concat(raender);
@@ -1156,23 +1417,22 @@
           var a = auswahl[i], c = auswahl[j];
           if (a.rand && c.rand && winkelAbstand(a.t, c.t) > 0.2) { continue; }
           var abst = Math.abs((c.px - a.px) * a.c + (c.py - a.py) * a.s);
-          if (abst < 0.16 * Math.min(b.w, b.h)) { continue; }
+          if (abst < 0.14 * Math.min(b.w, b.h)) { continue; }
           paare.push({ a: a, b: c, t: a.t, fam: fi,
                        guete: Math.min(a.stuetze, c.stuetze) * (0.6 + 0.4 * abst / b.diag) });
         }
       }
     }
     paare.sort(function (p, q) { return q.guete - p.guete; });
-    if (paare.length > 40) { paare = paare.slice(0, 40); }
+    if (paare.length > 50) { paare = paare.slice(0, 50); }
 
-    /* Paar x Paar -> Viereck */
     var roh = [];
     for (i = 0; i < paare.length; i++) {
       for (j = i + 1; j < paare.length; j++) {
         var P = paare[i], Q = paare[j];
         if (P.fam === Q.fam) { continue; }
         var wink = winkelAbstand(P.t, Q.t) * 180 / Math.PI;
-        if (wink < 48) { continue; }
+        if (wink < 42) { continue; }
         var e = [schnitt(P.a, Q.a), schnitt(Q.a, P.b), schnitt(P.b, Q.b), schnitt(Q.b, P.a)];
         if (!e[0] || !e[1] || !e[2] || !e[3]) { continue; }
         var q = sortiereEcken(e, b.w / 2, b.h / 2);
@@ -1187,14 +1447,12 @@
       }
     }
     roh.sort(function (p, q) { return q.grob - p.grob; });
-    if (roh.length > 26) { roh = roh.slice(0, 26); }
+    if (roh.length > 32) { roh = roh.slice(0, 32); }
 
-    /* genaue Bewertung */
     var best = null;
     var bewertet = [];
     function bewerteAlle(liste) {
       for (var n = 0; n < liste.length; n++) {
-        /* welche Seite liegt auf einem Bildrand? */
         var rs = [false, false, false, false];
         for (var k = 0; k < 4; k++) {
           var p1 = liste[n].q[k], p2 = liste[n].q[(k + 1) % 4];
@@ -1207,19 +1465,7 @@
         bw.quelle = liste[n].kiQuelle ? "ki"
                   : (liste[n].flaechenQuelle ? "flaeche" : "linien");
         if (liste[n].kiQuelle) {
-          /* Das Netz sieht ein Dokument auch dort, wo gar keine Kante im
-           * Bild ist (weisses Blatt auf weissem Tisch, Schattenrand,
-           * Finger ueber der Ecke). Reine Kantenbewertung kann das
-           * naturgemaess nicht belohnen - deshalb bekommt ein
-           * KI-Vorschlag einen Bonus, der mit seiner eigenen Sicherheit
-           * waechst. Bei unsicherer KI (<0.4) ist der Bonus klein, das
-           * Bild entscheidet dann weiter allein. */
           bw.kiKonf = liste[n].kiKonf;
-          /* Quadratisch, nicht linear: ein unsicheres Netz (z.B. weil das
-           * Dokument ueber alle vier Bildraender hinausragt und es die
-           * Ecken nur raet) bekommt dadurch sogar einen Abschlag statt
-           * eines Bonus und kann ein gut gestuetztes Viereck aus dem Bild
-           * nicht verdraengen. */
           bw.wert *= 0.5 + 1.8 * liste[n].kiKonf * liste[n].kiKonf;
           bw.konfidenz = Math.max(bw.konfidenz, 0.55 * liste[n].kiKonf +
                                                 0.45 * bw.konfidenz);
@@ -1231,7 +1477,6 @@
     }
     bewerteAlle(roh);
 
-    /* ---- Vorschlaege von aussen (KI) in dieselbe Bewertung werfen ---- */
     var kiListe = [], kiBester = null;
     var extern = optionen.kandidaten || [];
     for (i = 0; i < extern.length; i++) {
@@ -1247,37 +1492,24 @@
       }
       qk = sortiereEcken(qk, b.w / 2, b.h / 2);
       if (!konvex(qk)) { continue; }
-      if (flaeche(qk) < minFlaeche * b.w * b.h * 0.6) { continue; }
+      if (flaeche(qk) < minFlaeche * b.w * b.h * 0.5) { continue; }
       kiListe.push({ q: qk, kiQuelle: true, kiKonf: klemme(ekonf, 0, 1) });
     }
     if (kiListe.length) { bewerteAlle(kiListe); }
-    /* dasjenige KI-Viereck mit der besten gemeinsamen Bewertung */
     for (i = 0; i < kiListe.length; i++) {
       var kb = bewertet[bewertet.length - kiListe.length + i];
       if (!kiBester || kb.wert > kiBester.wert) { kiBester = kb; }
     }
 
-    /* Helligkeits-Fallback nur, wenn die Linien nichts Ueberzeugendes
-     * geliefert haben: er kostet mit Abstand die meiste Rechenzeit und
-     * wird im Normalfall gar nicht gebraucht.
-     *
-     * Fuer Standbilder kann er mit optionen.flaechenImmer erzwungen
-     * werden. Warum das wichtig ist: Auf einem weissen Untergrund ist
-     * eine FALSCHE Kante (Tischkante, Schattenrand, Stapelkante) oft
-     * besser "gestuetzt" als das Blatt selbst - dann sieht das Ergebnis
-     * der Linien-Suche ueberzeugend aus, obwohl es daneben liegt. Die
-     * Flaechen-Suche auf dem beleuchtungs-normalisierten Bild findet
-     * das Blatt trotzdem, und die gemeinsame Bewertung entscheidet dann
-     * anhand beider Vorschlaege. */
     var flAnzahl = 0;
     var kiSicherGenug = kiBester && kiBester.kiKonf > 0.85;
     if (!kiSicherGenug && (optionen.flaechenImmer ||
-        !best || best.konfidenz < 0.95 || best.flaeche < 0.2 ||
-         best.randSeiten.filter(Boolean).length)) {
+        !best || best.konfidenz < 0.92 || best.flaeche < 0.22 ||
+         best.randSeiten.filter(Boolean).length || b.kontrastStd < 18)) {
       var flk = flaechenKandidaten(b, optionen.flaechenImmer !== false), fliste = [];
       for (i = 0; i < flk.length; i++) {
         var qf = sortiereEcken(flk[i], b.w / 2, b.h / 2);
-        if (formOk(b, qf, minFlaeche)) {
+        if (formOk(b, qf, minFlaeche * 0.85)) {
           fliste.push({ q: qf, flaechenQuelle: true });
         }
       }
@@ -1291,100 +1523,73 @@
       diagnose.geo = best.geo; diagnose.abdeckung = best.abdeckung;
       diagnose.polaritaet = best.polaritaet; diagnose.wert = best.wert;
       diagnose.quelle = best.quelle; diagnose.kontrast = best.kontrast;
+      diagnose.dichte = best.dichte;
     }
     if (!best) { return null; }
 
-    /* AUSSEN GEWINNT: Liegt der Sieger vollstaendig INNERHALB eines anderen,
-     * ebenfalls gut gestuetzten Kandidaten, dann ist der aeussere das
-     * Dokument und der innere nur ein Teil davon (Textblock, Tabelle,
-     * Bild im Dokument). Genau dieser Fall liess Scans "angeschnitten"
-     * wirken. */
     if (modul.diagnose.alle && modul.diagnose.alle.length) {
       best = aussenGewinnt(modul.diagnose.alle, best);
     } else {
       best = aussenGewinnt(bewertet, best);
     }
 
-    /* ------------------------------------------------------------------
-     * KI-VORRANG (das eigentliche Gegenmittel gegen "weiss auf weiss")
-     * ------------------------------------------------------------------
-     * Gemessen auf den harten Szenen (tools/testbilder_hart.py: weisses
-     * Blatt auf weisser Decke, Stapel, harter Schatten, Blitzlicht):
-     *
-     *   reine Geometrie   mittlerer Eckfehler 7,3 %
-     *   DocAligner allein mittlerer Eckfehler 1,9 %   (14 von 15 < 3 %)
-     *   bisherige Fusion  mittlerer Eckfehler 5,0 %   <-- die Fusion
-     *                                                    verdarb die
-     *                                                    gute KI-Antwort
-     *
-     * Der Grund ist strukturell: Auf weissem Untergrund bekommt eine
-     * FALSCHE Kante (Tischkante, Schattenrand, Stapelkante) mehr
-     * "Kantenstuetze" als das Blatt - sie ist einfach kontrastreicher.
-     * Die gemeinsame Bewertung, die nach Kantenstuetze urteilt, waehlt
-     * dann den falschen Kandidaten, obwohl das Netz das Blatt sicher
-     * gefunden hat.
-     *
-     * Deshalb gilt: Ist das Netz sicher, gibt SEINE Lage den Ausschlag.
-     * Die Geometrie darf sie nur behalten, wenn sie dasselbe Viereck
-     * sieht - dann ist ihre Kante (subpixelgenau nachgezogen) die
-     * bessere Wahl. Weicht sie ab, gewinnt die KI.
-     *
-     * Umgekehrt bleibt alles beim Alten, wenn das Netz unsicher ist:
-     * dann entscheidet wie bisher die gemeinsame Bewertung.
-     */
-    var KI_SICHER = 0.62;
+    // Stapel-Korrektur: Top-Blatt statt Stapel
+    best = stapelKorrektur(bewertet, best, kiBester);
+
+    var KI_SICHER = 0.58; // leicht gesenkt von 0.62 fuer weiss-auf-weiss
     if (kiBester && kiBester.kiKonf >= KI_SICHER && kiBester.flaeche >= 0.02) {
       if (best.quelle === "ki") {
-        /* schon die KI vorn - nichts zu tun */
       } else {
         var abw = mittlererAbstand(best.q, kiBester.q) / b.diag;
         var zustimmung = abw < 0.035;
         if (!zustimmung) {
-          /* Die klassischen Vierecke sind zwar aeusserlich gut gestuetzt,
-           * liegen aber woanders. Ein Viereck, das das KI-Viereck
-           * vollstaendig umschliesst, ist trotzdem verdaechtig (Stapel,
-           * Tischkante). Nur wenn das KI-Viereck praktisch deckungsgleich
-           * ist, bleibt die klassische Kante stehen. */
           diagnose.kiUeberstimmt = true;
-          best = kiBester;
+          // Bei weiss-auf-weiss: KI gewinnt auch wenn klassisch gut aussieht
+          if (b.kontrastStd < 18 || kiBester.kiKonf >= 0.68) {
+            best = kiBester;
+          } else if (kiBester.kiKonf >= 0.72) {
+            best = kiBester;
+          }
         }
+      }
+    }
+    // Extra: Bei sehr niedrigem Kontrast und vorhandener KI mit >=0.35, KI nehmen
+    if (kiBester && b.kontrastStd < 12 && kiBester.kiKonf >= 0.35) {
+      if (!best || best.quelle !== "ki") {
+        diagnose.kiWeissAufWeiss = true;
+        best = kiBester;
       }
     }
     diagnose.kiKonf = kiBester ? kiBester.kiKonf : 0;
 
-    /* Mindestanforderungen - sonst lieber "nichts gefunden" melden.
-     *
-     * Ausnahme fuer die KI: ihre Aussage haengt NICHT an sichtbaren
-     * Kanten. Ein helles Blatt auf hellem Tisch hat kaum Kantenstuetze
-     * (geo klein), ist aber trotzdem ein Dokument. Deshalb genuegt bei
-     * einem sicheren KI-Viereck eine deutlich kleinere Huerde - sonst
-     * meldet die App weiter "kein Dokument", obwohl sie es gesehen hat. */
-    var kiTraegt = best.quelle === "ki" && best.kiKonf >= 0.52;
+    var kiTraegt = best.quelle === "ki" && best.kiKonf >= 0.45;
     if (kiTraegt) {
-      /* KI-Viereck: eigene, niedrigere Huerde (siehe oben). */
-      if (best.flaeche < 0.03) { diagnose.abgelehnt = true; return null; }
-    } else if (best.geo < 3.0 || best.abdeckung < 0.38) {
-      diagnose.abgelehnt = true; return null;
+      if (best.flaeche < 0.025) { diagnose.abgelehnt = true; return null; }
+    } else if (best.geo < 2.2 || best.abdeckung < 0.30) {
+      // Bei niedrigem Kontrast niedrigere Huerden
+      if (b.kontrastStd < 14) {
+        if (best.geo < 0.8 || best.abdeckung < 0.10) { diagnose.abgelehnt = true; return null; }
+      } else if (b.kontrastStd < 20) {
+        if (best.geo < 1.4 || best.abdeckung < 0.18) { diagnose.abgelehnt = true; return null; }
+      } else {
+        diagnose.abgelehnt = true; return null;
+      }
     }
 
-    /* Nachziehen: moeglichst in hoeherer Aufloesung */
     var quad = best.q;
     var feinKante = optionen.feinKante || Math.min(Math.max(breite, hoehe), arbeitsKante * 2.5);
     var fein = b, faktorX = 1, faktorY = 1;
     if (feinKante > arbeitsKante * 1.2) {
       fein = arbeitsbild(rgba, breite, hoehe, feinKante, 1);
+      // Textur fuer fein auch? Nicht noetig fuer Verfeinerung
+      fein.pkte = pkte;
       faktorX = fein.w / b.w; faktorY = fein.h / b.h;
       quad = quad.map(function (p) { return [p[0] * faktorX, p[1] * faktorY]; });
     }
-    /* Nachziehen: bei einem KI-Viereck kleiner suchen. Die Ecken sitzen
-     * dann schon fast richtig; ein weiter Suchkorridor wuerde nur das
-     * Risiko erhoehen, auf eine Textzeile oder einen Schattenrand
-     * danebenzuspringen. */
     var such = Math.max(4, (kiTraegt ? 0.012 : 0.022) * fein.diag);
     quad = verfeinere(fein, quad, such);
     quad = verfeinere(fein, quad, Math.max(3, such * 0.45));
 
-    /* zurueck in Eingabekoordinaten */
     var sx = breite / fein.w, sy = hoehe / fein.h;
     var ergebnis = quad.map(function (p) {
       return [klemme(p[0] * sx, -0.02 * breite, breite * 1.02),
@@ -1401,19 +1606,20 @@
       polaritaet: best.polaritaet,
       randSeiten: best.randSeiten,
       randZahl: best.randSeiten.filter(Boolean).length,
-      quelle: best.quelle
+      quelle: best.quelle,
+      dichte: best.dichte,
+      kontrastStd: b.kontrastStd
     };
   }
 
   var modul = {
     erkenne: erkenne,
-    /* fuer Tests / Wiederverwendung */
     _intern: {
       arbeitsbild: arbeitsbild, kantenPunkte: kantenPunkte,
       houghLinien: houghLinien, verfeinere: verfeinere,
       bewerte: bewerte, sortiereEcken: sortiereEcken, flaeche: flaeche
     },
-    version: 3
+    version: 4
   };
   global.UltraErkennung = modul;
 
