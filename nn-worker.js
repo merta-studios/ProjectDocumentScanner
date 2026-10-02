@@ -73,14 +73,18 @@ async function starten() {
   try {
     await netz.lade();
     postMessage({ typ: "ki-status", bereit: true });
-    /* Kruemmungs-Modell gleich im Hintergrund nachladen. */
-    setTimeout(uvLaden, 1500);
+    /* Kruemmungs-Modell gleich im Hintergrund nachladen - schneller fuer Buchseiten */
+    setTimeout(uvLaden, 400);
   } catch (f) {
     postMessage({
       typ: "ki-status", bereit: false,
       meldung: (f && f.message) ? f.message : String(f)
     });
   }
+  // Zweiter Versuch falls erster fehlschlug (z.B. Netzwerk langsam)
+  setTimeout(function () {
+    if (!uvBereit && !uvLaeuft) { uvLaden(); }
+  }, 5000);
 }
 
 self.onmessage = async function (e) {

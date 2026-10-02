@@ -131,6 +131,69 @@ async function lade(optionen) {
  * naechstliegenden gefuellten Feld kopiert. Das entspricht genau dem
  * "Rand fortsetzen" von OpenCV, kostet aber nichts extra.
  */
+function beleuchtungsFeldFuerKI(rgba, breite, hoehe) {
+  // Schaetzt Beleuchtungsfeld fuer Schatten-Korrektur (weiss auf weiss)
+  var dw = 32, dh = 32;
+  var g = new Float32Array(dw * dh);
+  var anz = new Float32Array(dw * dh);
+  var xi = new Int32Array(breite), yi = new Int32Array(hoehe);
+  for (var x = 0; x < breite; x++) { xi[x] = Math.min(dw - 1, (x * dw / breite) | 0); }
+  for (var y = 0; y < hoehe; y++) { yi[y] = Math.min(dh - 1, (y * dh / hoehe) | 0); }
+  for (var y = 0; y < hoehe; y++) {
+    var zeile = y * breite * 4, ziel = yi[y] * dw;
+    for (var x = 0; x < breite; x++) {
+      var p = zeile + x * 4;
+      var l = (rgba[p] * 299 + rgba[p + 1] * 587 + rgba[p + 2] * 114) * 0.001;
+      var k = ziel + xi[x];
+      g[k] += l; anz[k]++;
+    }
+  }
+  for (var i = 0; i < dw * dh; i++) { g[i] = anz[i] ? g[i] / anz[i] : 0; }
+  // Box-Blur 2x
+  var r = 2;
+  var tmp = new Float32Array(dw * dh);
+  for (var y = 0; y < dh; y++) {
+    var z = y * dw, s = 0;
+    for (var x = -r; x <= r; x++) { if (x >= 0 && x < dw) { s += g[z + x]; } }
+    for (var x = 0; x < dw; x++) {
+      tmp[z + x] = s / (2 * r + 1);
+      var raus = x - r, rein = x + r + 1;
+      if (raus >= 0) { s -= g[z + raus]; }
+      if (rein < dw) { s += g[z + rein]; }
+    }
+  }
+  var feld = new Float32Array(dw * dh);
+  for (var x = 0; x < dw; x++) {
+    var s2 = 0;
+    for (var y = -r; y <= r; y++) { if (y >= 0 && y < dh) { s2 += tmp[y * dw + x]; } }
+    for (var y = 0; y < dh; y++) {
+      feld[y * dw + x] = s2 / (2 * r + 1);
+      var ro = y - r, ri = y + r + 1;
+      if (ro >= 0) { s2 -= tmp[ro * dw + x]; }
+      if (ri < dh) { s2 += tmp[ri * dw + x]; }
+    }
+  }
+  var sum = 0;
+  for (var i = 0; i < dw * dh; i++) { sum += feld[i]; }
+  var mittel = sum / (dw * dh) || 128;
+  // Gewinn
+  var gewinn = new Float32Array(dw * dh);
+  var stdSum = 0;
+  for (var i = 0; i < dw * dh; i++) {
+    var d = feld[i] - mittel;
+    stdSum += d * d;
+  }
+  var std = Math.sqrt(stdSum / (dw * dh));
+  // Nur bei nennenswertem Schatten (std > 8) korrigieren
+  if (std < 8) { return null; }
+  for (var i = 0; i < dw * dh; i++) {
+    var gv = mittel / Math.max(feld[i], 1);
+    if (gv > 2.2) { gv = 2.2; } else if (gv < 0.55) { gv = 0.55; }
+    gewinn[i] = gv;
+  }
+  return { gewinn: gewinn, dw: dw, dh: dh, xi: xi, yi: yi, std: std };
+}
+
 function tensorBauen(rgba, breite, hoehe, randAnteil) {
   var pad = Math.round(randAnteil * Math.max(breite, hoehe));
   var gw = breite + 2 * pad, gh = hoehe + 2 * pad;
@@ -147,13 +210,25 @@ function tensorBauen(rgba, breite, hoehe, randAnteil) {
     yi[y] = Math.min(KANTE - 1, Math.max(0, ((y + pad) * KANTE / gh) | 0));
   }
 
+  // Beleuchtungsfeld fuer weiss-auf-weiss / Schatten
+  var licht = null;
+  try { licht = beleuchtungsFeldFuerKI(rgba, breite, hoehe); } catch (e) { licht = null; }
+
   for (y = 0; y < hoehe; y++) {
     var zeile = y * breite * 4, ziel = yi[y] * KANTE;
     for (x = 0; x < breite; x++) {
       var p = zeile + x * 4, k = ziel + xi[x];
-      sumR[k] += rgba[p];
-      sumG[k] += rgba[p + 1];
-      sumB[k] += rgba[p + 2];
+      var r = rgba[p], g = rgba[p + 1], b = rgba[p + 2];
+      if (licht) {
+        var lx = licht.xi[x], ly = licht.yi[y];
+        var gv = licht.gewinn[ly * licht.dw + lx] || 1;
+        r = Math.min(255, r * gv);
+        g = Math.min(255, g * gv);
+        b = Math.min(255, b * gv);
+      }
+      sumR[k] += r;
+      sumG[k] += g;
+      sumB[k] += b;
       anz[k]++;
     }
   }
@@ -343,46 +418,90 @@ function plausibel(q, breite, hoehe) {
  * die sicherste Antwort gewaehlt; der Rand mit dem hoechsten
  * Waermekarten-Spitz (konfidenz) gewinnt.
  * -------------------------------------------------------------------- */
-var RAENDER = [0.12, 0.30, 0.20, 0.45];
+/* Mehr Raender fuer schwierige Faelle:
+ * 0.08 = praezise wenn Blatt den Sucher fuellt
+ * 0.60 = viel Kontext fuer weiss-auf-weiss / Stapel
+ * Reihenfolge: erst die wahrscheinlichsten, dann exotische.
+ * Messung: weiss auf weisser Decke braucht 0.45-0.60 fuer Schatten-Kontext,
+ * Stapel braucht 0.30-0.45 um Nachbarblaetter zu sehen. */
+var RAENDER = [0.12, 0.20, 0.30, 0.08, 0.45, 0.60];
 
 async function erkenneGruendlich(rgba, breite, hoehe) {
   var best = null;
+  var zweitBest = null;
   for (var i = 0; i < RAENDER.length; i++) {
     var r = null;
     try { r = await erkenne(rgba, breite, hoehe, { rand: RAENDER[i] }); } catch (e) { r = null; }
-    if (r && (!best || r.konfidenz > best.konfidenz)) { best = r; }
-    /* Sicher genug -> die restlichen Durchgaenge sparen. 0.88 ist der
-     * Wert, ab dem in den Messungen praktisch keine Verbesserung mehr
-     * kam. */
-    if (best && best.konfidenz > 0.88) { break; }
+    if (r) {
+      // Bevorzuge hoehere Konfidenz, aber bei aehnlicher Konfidenz das kleinere
+      // Viereck wenn es deutlich kompakter ist (Top-Blatt vs Stapel)
+      if (!best || r.konfidenz > best.konfidenz + 0.04) {
+        if (best && best.konfidenz > 0.35) { zweitBest = best; }
+        best = r;
+      } else if (!best) {
+        best = r;
+      } else {
+        // Aehnliche Konfidenz: wenn neues deutlich kleiner und plausibel, merke als Alternative
+        var flBest = flaeche(best.quad), flNeu = flaeche(r.quad);
+        if (flNeu < flBest * 0.85 && flNeu > flBest * 0.25 && r.konfidenz > 0.32) {
+          if (!zweitBest || r.konfidenz > zweitBest.konfidenz) { zweitBest = r; }
+        }
+      }
+    }
+    if (best && best.konfidenz > 0.90) { break; }
+  }
+  // Falls best sehr gross (fast ganzes Bild) und zweitBest existiert mit
+  // hoeherer Dichte / kleinerer Flaeche, nimm zweitBest fuer Stapel-Fall
+  if (best && zweitBest) {
+    var flB = flaeche(best.quad), flZ = flaeche(zweitBest.quad);
+    if (flB > flZ * 1.18 && flZ < breite * hoehe * 0.88) {
+      // Pruefe ob zweitBest komplett innerhalb best liegt (Stapel)
+      var innen = 0;
+      for (var k = 0; k < 4; k++) {
+        var px = zweitBest.quad[k][0], py = zweitBest.quad[k][1];
+        // einfache Bounding-Box Pruefung + Punkt-in-Poly fuer best
+        if (px >= Math.min(best.quad[0][0], best.quad[1][0], best.quad[2][0], best.quad[3][0]) &&
+            px <= Math.max(best.quad[0][0], best.quad[1][0], best.quad[2][0], best.quad[3][0]) &&
+            py >= Math.min(best.quad[0][1], best.quad[1][1], best.quad[2][1], best.quad[3][1]) &&
+            py <= Math.max(best.quad[0][1], best.quad[1][1], best.quad[2][1], best.quad[3][1])) {
+          innen++;
+        }
+      }
+      if (innen >= 3 && zweitBest.konfidenz >= 0.30) {
+        // Top-Blatt wahrscheinlicher
+        if (zweitBest.konfidenz > best.konfidenz * 0.65) {
+          best = zweitBest;
+        }
+      }
+    }
   }
   return best;
 }
 
-/* ----------------------------------------------------------------------
- * Live-Variante: erst die normale Reserve, bei schwachem Ergebnis sofort
- * eine zweite mit viel Rand.
- *
- * Der Hintergrund ist derselbe wie oben, nur unter Zeitdruck: im Sucher
- * sind die Frames klein, verrauscht und JPEG-komprimiert, und das Blatt
- * laeuft oft ueber den Rand. Mit 0.12 allein fand das Netz auf den harten
- * Szenen 84 von 90 Frames, mit zusaetzlichem 0.26 alle 90.
- *
- * Die zweite Runde laeuft nur, wenn die erste unsicher war - im
- * Normalfall kostet das also nichts.
- * -------------------------------------------------------------------- */
+/* Live-Variante: drei Stufen, letzte nur bei sehr niedrigem Kontrast */
 async function erkenneLive(rgba, breite, hoehe) {
   var r = null;
   try { r = await erkenne(rgba, breite, hoehe, { rand: 0.14 }); } catch (e) { r = null; }
   if (r && r.konfidenz >= 0.55) { return r; }
   var r2 = null;
   try { r2 = await erkenne(rgba, breite, hoehe, { rand: 0.28 }); } catch (e) { r2 = null; }
-  /* Die zweite Runde muss DEUTLICH besser sein, nicht nur ein wenig:
-   * sonst wechselt der Rahmen im Sucher staendig zwischen zwei fast
-   * gleich guten Lagen hin und her - und genau das sieht aus wie Zittern. */
-  var huerde = (r ? r.konfidenz : 0) + 0.12;
-  if (r2 && r2.konfidenz > Math.max(0.55, huerde)) { return r2; }
-  return r;
+  var huerde = (r ? r.konfidenz : 0) + 0.10;
+  if (r2 && r2.konfidenz > Math.max(0.50, huerde)) {
+    if (r2.konfidenz >= 0.60) { return r2; }
+    // Noch unsicher -> dritte Runde mit viel Kontext fuer weiss-auf-weiss
+    var r3 = null;
+    try { r3 = await erkenne(rgba, breite, hoehe, { rand: 0.45 }); } catch (e) { r3 = null; }
+    if (r3 && r3.konfidenz > r2.konfidenz + 0.06) { return r3; }
+    return r2;
+  }
+  if (r2 && !r) { return r2; }
+  // Wenn beide schwach, versuche 0.45 direkt
+  if ((!r || r.konfidenz < 0.40) && (!r2 || r2.konfidenz < 0.40)) {
+    var r3b = null;
+    try { r3b = await erkenne(rgba, breite, hoehe, { rand: 0.45 }); } catch (e) { r3b = null; }
+    if (r3b && r3b.konfidenz > Math.max(r ? r.konfidenz : 0, r2 ? r2.konfidenz : 0)) { return r3b; }
+  }
+  return r || r2;
 }
 
 function bereit() { return !!sitzung; }
