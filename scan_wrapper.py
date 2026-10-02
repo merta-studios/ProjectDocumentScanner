@@ -545,7 +545,7 @@ def _uvdoc_lohnt(src, hinweis, gitter):
     warped_vor = entzerren(klein, quad_k)
     vorher = _kruemmung(warped_vor)
     ist_tab, _, _ = _istTabelle(warped_vor, kante=700)
-    gerad_vor = _linienGeradheit(warped_vor, kante=700) if ist_tab else 0.0
+    gerad_vor = _linienGeradheit(warped_vor, kante=700)
     if vorher <= 0.45 and gerad_vor <= 0.6:
         return False, vorher, vorher
     try:
@@ -554,11 +554,11 @@ def _uvdoc_lohnt(src, hinweis, gitter):
     except Exception:
         return False, vorher, vorher
     nachher = _kruemmung(warped_nach)
-    gerad_nach = _linienGeradheit(warped_nach, kante=700) if ist_tab else 0.0
+    gerad_nach = _linienGeradheit(warped_nach, kante=700)
     lohnt_kruemm = nachher < 0.9 * vorher if vorher > 0.45 else True
+    if not _geradheit_erhalten(gerad_vor, gerad_nach):
+        return False, vorher, nachher
     if ist_tab:
-        if gerad_vor > 0 and gerad_nach > gerad_vor * 1.35:
-            return False, vorher, nachher
         if vorher > 0.5 and nachher >= vorher * 0.92:
             return False, vorher, nachher
     if vorher <= 0.6 and nachher > vorher * 1.15:
@@ -624,7 +624,7 @@ def scan_bgr(src, hinweis=None, streng=False, veredelung="farbe", uvdoc=None):
 
     warped = entzerren(src, quad)
     ist_tab, h_tab, v_tab = _istTabelle(warped, kante=700)
-    gerad_vor = _linienGeradheit(warped, kante=700) if ist_tab else 0.0
+    gerad_vor = _linienGeradheit(warped, kante=700)
     if ist_tab:
         info["tabelle"] = {"h": h_tab, "v": v_tab, "geradheit": round(gerad_vor, 2)}
         meldungen.append(f"Tabelle erkannt ({h_tab} horiz., {v_tab} vert. Linien, Geradheit {gerad_vor:.2f}px) - schonende Entzerrung.")
@@ -642,19 +642,14 @@ def scan_bgr(src, hinweis=None, streng=False, veredelung="farbe", uvdoc=None):
                 my = np.clip(my, 0, H-1)
                 kandidat = cv2.remap(warped, mx.astype(np.float32), my.astype(np.float32),
                                      cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-                if ist_tab:
-                    gerad_nach = _linienGeradheit(kandidat, kante=700)
-                    if gerad_nach <= gerad_vor * 1.25 or gerad_vor < 0.5:
-                        warped = kandidat
-                        info["uvdoc"] = "angewandt_nach"
-                        meldungen.append(f"Buchkruemmung nach Entzerren geglaettet (Kruemmung {vor2:.2f} -> {nach2:.2f}px).")
-                    else:
-                        info["uvdoc"] = "verworfen_nach_tabelle"
-                        meldungen.append(f"Kruemmungs-Glaettung nach Entzerren verworfen (Tabelle waere wellig: {gerad_vor:.2f} -> {gerad_nach:.2f}px).")
-                else:
+                gerad_nach = _linienGeradheit(kandidat, kante=700)
+                if _geradheit_erhalten(gerad_vor, gerad_nach):
                     warped = kandidat
                     info["uvdoc"] = "angewandt_nach"
                     meldungen.append(f"Buchkruemmung nach Entzerren geglaettet (Kruemmung {vor2:.2f} -> {nach2:.2f}px).")
+                else:
+                    info["uvdoc"] = "verworfen_nach_geradheit"
+                    meldungen.append(f"Kruemmungs-Glaettung nach Entzerren verworfen (Linien waeren welliger: {gerad_vor:.2f} -> {gerad_nach:.2f}px).")
             else:
                 if vor2 > 0.45 and info.get("uvdoc","").startswith("verworfen") == False:
                     info["uvdoc"] = "verworfen_nach"
@@ -704,22 +699,18 @@ def scan_bgr(src, hinweis=None, streng=False, veredelung="farbe", uvdoc=None):
             meldungen.append("Drehung verworfen (keine ausreichende Verbesserung).")
 
     vor = zeilen_guete(warped)
-    gerad_aktuell = _linienGeradheit(warped, kante=700) if ist_tab else 0.0
+    gerad_aktuell = _linienGeradheit(warped, kante=700)
     kandidat, curve_amp = scanner.flatten_curvature(warped)
     if curve_amp:
         guete_nach = zeilen_guete(kandidat)
         schwelle = 1.08 if ist_tab else 1.02
         if guete_nach >= vor * schwelle:
-            if ist_tab:
-                gerad_nach = _linienGeradheit(kandidat, kante=700)
-                if gerad_nach > gerad_aktuell * 1.35 and gerad_aktuell > 0.3:
-                    meldungen.append(f"Wellen-Glaettung verworfen (Tabelle wellig: {gerad_aktuell:.2f} -> {gerad_nach:.2f}px).")
-                else:
-                    warped = kandidat
-                    meldungen.append(f"Wellen-Glaettung: Kruemmung bis {curve_amp:.1f}px begradigt.")
-            else:
+            gerad_nach = _linienGeradheit(kandidat, kante=700)
+            if _geradheit_erhalten(gerad_aktuell, gerad_nach):
                 warped = kandidat
                 meldungen.append(f"Wellen-Glaettung: Kruemmung bis {curve_amp:.1f}px begradigt.")
+            else:
+                meldungen.append(f"Wellen-Glaettung verworfen (Linien waeren welliger: {gerad_aktuell:.2f} -> {gerad_nach:.2f}px).")
         else:
             meldungen.append("Wellen-Glaettung verworfen (haette den Text verzogen).")
 
@@ -728,10 +719,15 @@ def scan_bgr(src, hinweis=None, streng=False, veredelung="farbe", uvdoc=None):
             meldungen.append("Buch-Entzerrung uebersprungen - Tabelle erkannt.")
         else:
             vor = zeilen_guete(warped)
+            gerad_buch_vor = _linienGeradheit(warped, kante=700)
             kandidat, mdev = scanner.dewarp_book_margins(warped)
-            if mdev and zeilen_guete(kandidat) >= vor * 0.99:
+            gerad_buch_nach = _linienGeradheit(kandidat, kante=700)
+            if (mdev and _geradheit_erhalten(gerad_buch_vor, gerad_buch_nach)
+                    and zeilen_guete(kandidat) >= vor * 0.99):
                 warped = kandidat
                 meldungen.append(f"Rand-Entzerrung: Textraender um bis zu {mdev:.1f}px begradigt.")
+            elif mdev:
+                meldungen.append(f"Rand-Entzerrung verworfen (Linien waeren welliger: {gerad_buch_vor:.2f} -> {gerad_buch_nach:.2f}px).")
             kandidat, sfac = scanner.decompress_book_x(warped)
             if sfac > 1.0:
                 warped = kandidat
