@@ -106,6 +106,43 @@ def _quad_plausibel(quad, h, w):
             return False
     return True
 
+def _winkel_grad(v):
+    """Richtung einer Kante in Grad, auf [-90, 90) normiert."""
+    a = float(np.degrees(np.arctan2(v[1], v[0])))
+    while a >= 90.0:
+        a -= 180.0
+    while a < -90.0:
+        a += 180.0
+    return a
+
+def _geometrie_stufe(img, name, quad=None):
+    """Messbare Geometrie fuer Diagnose, nicht als Geradeheits-Ersatz.
+
+    Die vier Rasterecken sind absichtlich kein Dokumentnachweis. Bei einem
+    Quad messen wir deshalb sowohl die Seitenrichtung als auch die vier
+    Innenwinkel. Nach einem Warp ohne Quad werden die sichtbaren Konturen
+    spaeter separat im Diagnoseprogramm vermessen.
+    """
+    h, w = img.shape[:2]
+    eintrag = {"stufe": name, "hoehe": int(h), "breite": int(w)}
+    if quad is None:
+        return eintrag
+    q = _ordne_robust(quad)
+    kanten = q[np.arange(4)] - q[np.roll(np.arange(4), -1)]
+    winkel = []
+    for i in range(4):
+        u = q[(i - 1) % 4] - q[i]
+        v = q[(i + 1) % 4] - q[i]
+        den = np.linalg.norm(u) * np.linalg.norm(v)
+        c = float(np.dot(u, v) / den) if den > 1e-9 else 1.0
+        winkel.append(float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0)))))
+    eintrag.update({
+        "quad": [[float(x), float(y)] for x, y in q],
+        "seitenwinkel_grad": [round(_winkel_grad(v), 3) for v in kanten],
+        "eckwinkel_grad": [round(x, 3) for x in winkel],
+    })
+    return eintrag
+
 def viereck_bestimmen(src, hinweis=None):
     h, w = src.shape[:2]
     if hinweis is not None and _quad_plausibel(hinweis, h, w):
@@ -586,7 +623,9 @@ def _uvdoc_lohnt_nach_warp(warped, gitter):
 
 def scan_bgr(src, hinweis=None, streng=False, veredelung="farbe", uvdoc=None):
     meldungen = []
-    info = {"dokument_erkannt": False, "meldungen": meldungen}
+    stufen = []
+    info = {"dokument_erkannt": False, "meldungen": meldungen,
+            "stufen": stufen}
     uvdoc_angewandt_vor = False
     if uvdoc is not None:
         try:
@@ -599,6 +638,7 @@ def scan_bgr(src, hinweis=None, streng=False, veredelung="farbe", uvdoc=None):
         if lohnt:
             try:
                 src = _uvdoc_gitter_anwenden(src, uvdoc, align_corners=True)
+                stufen.append(_geometrie_stufe(src, "nach_uvdoc_vor_warp"))
                 uvdoc_angewandt_vor = True
                 info["uvdoc"] = "angewandt_vor"
                 meldungen.append("Buchkruemmung geglaettet (Zeilenbiegung %.2f auf %.2f px)." % (vorher, nachher))
@@ -622,7 +662,9 @@ def scan_bgr(src, hinweis=None, streng=False, veredelung="farbe", uvdoc=None):
     else:
         info["quad"] = [[float(a), float(b)] for a, b in quad]
 
+    stufen.append(_geometrie_stufe(src, "quad_vor_warp", quad))
     warped = entzerren(src, quad)
+    stufen.append(_geometrie_stufe(warped, "nach_perspektiv_warp"))
     ist_tab, h_tab, v_tab = _istTabelle(warped, kante=700)
     gerad_vor = _linienGeradheit(warped, kante=700)
     if ist_tab:
@@ -725,6 +767,7 @@ def scan_bgr(src, hinweis=None, streng=False, veredelung="farbe", uvdoc=None):
             if (mdev and _geradheit_erhalten(gerad_buch_vor, gerad_buch_nach)
                     and zeilen_guete(kandidat) >= vor * 0.99):
                 warped = kandidat
+                stufen.append(_geometrie_stufe(warped, "nach_buch_rand_entzerrung"))
                 meldungen.append(f"Rand-Entzerrung: Textraender um bis zu {mdev:.1f}px begradigt.")
             elif mdev:
                 meldungen.append(f"Rand-Entzerrung verworfen (Linien waeren welliger: {gerad_buch_vor:.2f} -> {gerad_buch_nach:.2f}px).")
