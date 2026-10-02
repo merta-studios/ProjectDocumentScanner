@@ -1,14 +1,14 @@
 /*
  * Ultra Scan - Service Worker: sorgt dafuer, dass die grossen Dateien
- * (Pyodide/OpenCV ca. 28 MB, ONNX Runtime + KI-Modell ca. 16 MB) nach dem
- * ersten Besuch dauerhaft gespeichert sind und die App danach
+ * (Pyodide/OpenCV ca. 28 MB, ONNX Runtime + KI-Modelle ca. 25 MB) nach
+ * dem ersten Besuch dauerhaft gespeichert sind und die App danach
  * blitzschnell (und sogar offline) startet.
  */
 "use strict";
 
 /* Version bei jeder Änderung der Startlogik erhöhen: so wird kein alter,
  * möglicherweise unvollständiger Worker aus dem Browser-Cache verwendet. */
-var CACHE_NAME = "ultra-scan-v5";
+var CACHE_NAME = "ultra-scan-v6";
 
 self.addEventListener("install", function (e) {
   self.skipWaiting();

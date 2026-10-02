@@ -44,3 +44,45 @@ Genau das macht `detect-nn.js`: Argmax suchen, dann in einem Fenster von
 Ausgefuehrt wird das Modell mit **onnxruntime-web 1.20.1** (MIT), ebenfalls
 selbst gehostet unter `vendor/onnxruntime-web-1.20.1/`. Kein CDN, kein
 Build-Schritt - passt zur Architektur der App.
+
+## `uvdoc-grid-712x488-int8.onnx` (8,1 MB)
+
+| | |
+|---|---|
+| **Projekt** | [tanguymagne/UVDoc](https://github.com/tanguymagne/UVDoc) - "UVDoc: Neural Grid-based Document Unwarping", SIGGRAPH Asia 2023 |
+| **Lizenz** | MIT (Copyright (c) 2023 Tanguy MAGNE) |
+| **Gewichte** | `model/best_model.pkl` aus dem Projekt-Repository (UVDocnet, 8 Mio. Parameter) |
+| **Aufgabe** | Fuer jedes Dokumentfoto das Gitter vorhersagen, das die gebogene Seite flachlegt (Buchseiten, gewoelbte Blaetter) |
+| **Eingang** | `image`, `float32[1, 3, 712, 488]` (Hoehe x Breite), **RGB**, Werte `0 … 1` |
+| **Ausgang** | `grid2d`, `float32[1, 2, 45, 31]` mit Werten in `-1 … 1` (Kanal 0 = x, Kanal 1 = y; Achse 1 gehoert zur Hoehe, Achse 2 zur Breite). `grid3d` (der 3D-Kopf) wird nicht benutzt. |
+
+Der Export wurde in dieser Umgebung aus den Originalgewichten erzeugt
+(`torch.onnx.export`, opset 17, feste Eingabegroesse 712x488; PyTorch 2.14
+braucht dafuer `dynamo=False`). Die 32-MB-Fassung wurde anschliessend
+dynamisch auf 8 Bit quantisiert:
+
+```python
+from onnxruntime.quantization import quantize_dynamic, QuantType
+quantize_dynamic("uvdoc-grid-712x488.onnx", "uvdoc-grid-712x488-int8.onnx",
+                 weight_type=QuantType.QUInt8, op_types_to_quantize=["Conv", "MatMul"])
+```
+
+Nachgemessen: Die Gitterwerte weichen im Mittel um 0.003 und hoechstens um
+0.05 (von 2.0 Wertebereich) von der 32-Bit-Fassung ab - deutlich weniger als
+die Unterschiede, die allein durch das Skalieren des Eingabebildes
+entstehen (max. 0.042). Im Browser laeuft die 8-Bit-Fassung zudem rund ein
+Viertel schneller, weil weniger Daten durch WebAssembly wandern.
+Die quantisierte Datei ist selbstenthalten - es gibt KEINE zusaetzliche
+`.data`-Datei.
+
+**Anwendung:** `detect-uvdoc.js` rechnet nur das Gitter aus (onnxruntime-web,
+~1 Sekunde). Angewendet wird es in `scan_wrapper.py` mit OpenCV - und zwar
+**nur, wenn es die Zeilen messbar gerader macht** (siehe Kommentar
+"Buchkruemmung" in `scan_wrapper.py`). Auf einer bereits geraden Seite kann
+UVDoc neue Wellen erzeugen; das Tor verwirft es dann.
+
+**Grenzen (selbst gemessen):** Das Netz ist auf Fotos trainiert, die ein
+Dokument formatfuellend zeigen. Bei kleinen Blaettern in grosser Umgebung
+oder bei stark abweichendem Seitenverhaeltnis laesst die Qualitaet nach.
+Deshalb wird es ueberhaupt nur auf bereits entzerrten Seiten geprueft und
+bei fehlendem Gewinn verworfen.

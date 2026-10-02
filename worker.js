@@ -139,17 +139,26 @@ function scannen(n) {
   pyodide.globals.set("quad_js", n.quad ? JSON.stringify(n.quad) : null);
   /* Scan-Stil aus der Oberflaeche: farbe | grau | sw (| original | roh). */
   pyodide.globals.set("stil_js", n.veredelung || "farbe");
+  /* Kruemmungs-Gitter aus detect-uvdoc.js (2 x 45 x 31 Werte) oder null.
+   * Es wird als JSON uebergeben - 2800 Zahlen, das ist billiger als eine
+   * eigene Uebertragung ueber die Pyodide-Grenze. Ob es angewendet wird,
+   * entscheidet scan_wrapper.py selbst (gemessen an den Textzeilen). */
+  /* Array.from ist noetig: JSON.stringify macht aus einem Float32Array
+   * sonst ein Objekt mit Zahlenschluesseln statt einer Liste. */
+  pyodide.globals.set("uvdoc_js", n.uvdoc ? JSON.stringify(Array.from(n.uvdoc)) : null);
   var proxy = pyodide.runPython(
     "import json, scan_wrapper\n" +
     "_q = json.loads(quad_js) if quad_js else None\n" +
+    "_g = json.loads(uvdoc_js) if uvdoc_js else None\n" +
     "_out, _h, _w, _info = scan_wrapper.scan_rgba_streng(rgba_js.to_py(), hoehe_js, breite_js, _q,\n" +
-    "                                                    veredelung=stil_js)\n" +
+    "                                                    veredelung=stil_js, uvdoc=_g)\n" +
     "(_out, _h, _w, json.dumps(_info))\n"
   );
   var ergebnis = proxy.toJs();
   proxy.destroy();
   pyodide.globals.delete("rgba_js");
   pyodide.globals.delete("quad_js");
+  pyodide.globals.delete("uvdoc_js");
   pyodide.globals.delete("stil_js");
   var info = JSON.parse(ergebnis[3]);
   if (!info.dokument_erkannt || !ergebnis[0]) {

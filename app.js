@@ -559,6 +559,17 @@ var kiLetzteSendung = 0;
 var KI_HALTBAR_MS = 700;        // aelter -> nicht mehr verwenden
 var KI_ABSTAND_MS = 60;         // Mindestabstand zweier KI-Anfragen
 
+/* Kruemmungs-Glaettung (UVDoc, siehe detect-uvdoc.js): Auf Anfrage liefert
+ * der KI-Worker ein 2 x 45 x 31 grosses Gitter, mit dem scan_wrapper.py
+ * gebogene Buchseiten flachlegt. Die Entscheidung, ob es angewendet wird,
+ * trifft die Pipeline selbst - gemessen an den Textzeilen. */
+var uvBereit = false;
+var uvWartet = {};              // marke -> Funktion
+var uvMarke = 0;
+var uvAuftraege = {};           // marke -> Funktion (Einzelauftrag "ausloesen")
+var UVDOC_WARTEN_MS = 6000;     // so lange darf es den Ausloeser aufhalten
+var uvLangsam = false;          // Modell war zu langsam -> nicht mehr warten
+
 try {
   kiWorker = new Worker("nn-worker.js", { type: "module" });
 } catch (f) {
@@ -588,7 +599,20 @@ if (kiWorker) {
     if (n.typ === "ki-standbild") {
       var auftrag = kiStandbild[n.marke];
       delete kiStandbild[n.marke];
-      if (auftrag) { auftrag(n.quad, n.konfidenz); }
+      if (auftrag) { auftrag(n.quad, n.konfidenz, n.gitter || null); }
+      return;
+    }
+    if (n.typ === "uvdoc-status") {
+      uvBereit = !!n.bereit;
+      if (!uvBereit && n.meldung) {
+        console.warn("Kruemmungs-Glaettung nicht verfuegbar:", n.meldung);
+      }
+      return;
+    }
+    if (n.typ === "uvdoc") {
+      var w = uvAuftraege[n.marke];
+      delete uvAuftraege[n.marke];
+      if (w) { w(n.gitter || null); }
     }
   };
   kiWorker.onerror = function (f2) {
@@ -931,7 +955,24 @@ function ausloesen() {
     var sx = cw / overlay.clientWidth, sy = ch / overlay.clientHeight;
     hinweisQuad = letzterQuad.map(function (p) { return [p[0] * sx, p[1] * sy]; });
   }
-  scanStarten(bd, hinweisQuad);
+  /* Erst das Kruemmungs-Gitter besorgen (gebogene Buchseiten), dann
+   * scannen. Ist das Modell nicht da oder zu langsam, geht es sofort los -
+   * der Ausloeser darf nie blockieren.
+   *
+   * Die Arbeitsanzeige kommt schon jetzt hoch, damit der Waehrend-der-
+   * Auswertung niemand denkt, der Tipp sei verloren gegangen. scanLaeuft
+   * sperrt sofort: ein zweiter Tipp waehrend des Wartens wuerde sonst zwei
+   * Scans starten. */
+  var gestartet = false;
+  scanLaeuft = true;
+  arbeitOverlay.classList.remove("verborgen");
+  aktualisiereTopbarStatus();
+  uvMarke++;
+  gitterHolen(bd, uvMarke, function (gitter) {
+    if (gestartet) { return; }
+    gestartet = true;
+    scanStarten(bd, hinweisQuad, gitter);
+  });
 }
 
 function blitzen() {
@@ -978,7 +1019,7 @@ if (stilPille) { stilPille.addEventListener("click", stilWeiter); }
 stilLaden();
 
 /* ========================== Scannen ============================= */
-function scanStarten(bilddaten, quadHinweis) {
+function scanStarten(bilddaten, quadHinweis, gitter) {
   scanLaeuft = true;
   zuruecksetzenErkennung();
   arbeitOverlay.classList.remove("verborgen");
@@ -988,8 +1029,39 @@ function scanStarten(bilddaten, quadHinweis) {
     typ: "scan", rgba: puffer,
     breite: bilddaten.width, hoehe: bilddaten.height,
     quad: quadHinweis || null,
+    /* Kruemmungs-Gitter (oder null): scan_wrapper.py prueft selbst, ob es
+     * die Textzeilen gerader macht, und verwirft es sonst. */
+    uvdoc: gitter || null,
     veredelung: STILE[stilIndex].id
   }, [puffer]);
+}
+
+/* Holt das Kruemmungs-Gitter vom KI-Worker. Falls das Modell noch laedt,
+ * zu langsam ist oder fehlt, wird nach UVDOC_WARTEN_MS ohne Glaettung
+ * gescannt - die App darf davon nie haengen bleiben. */
+function gitterHolen(bilddaten, marke, fertig) {
+  var erledigt = false;
+  var weiter = function (g) {
+    if (erledigt) { return; }
+    erledigt = true;
+    delete uvAuftraege[marke];
+    fertig(g || null);
+  };
+  if (!kiWorker || !uvBereit || uvLangsam) { weiter(null); return; }
+  var kopie = new Uint8ClampedArray(bilddaten.data);
+  uvAuftraege[marke] = weiter;
+  kiWorker.postMessage({
+    typ: "uvdoc", marke: marke, rgba: kopie.buffer,
+    breite: bilddaten.width, hoehe: bilddaten.height
+  }, [kopie.buffer]);
+  setTimeout(function () {
+    if (erledigt) { return; }
+    /* Diesmal nicht warten - und fuer den Rest der Sitzung auch nicht
+     * mehr: ein Geraet, das 6 s fuer das Gitter braucht, soll den
+     * Ausloeser nicht jedes Mal blockieren. */
+    uvLangsam = true;
+    weiter(null);
+  }, UVDOC_WARTEN_MS);
 }
 
 /* Fuer Bilder OHNE Live-Erkennung (Foto, Datei, Zwischenablage): erst die
@@ -1000,22 +1072,22 @@ function scanMitVorerkennung(bilddaten) {
   standbildMarke++;
   var marke = standbildMarke;
   var fertig = false;
-  var los = function (quad) {
+  var los = function (quad, gitter) {
     if (fertig) { return; }
     fertig = true;
-    scanStarten(bilddaten, quad || null);
+    scanStarten(bilddaten, quad || null, gitter || null);
   };
   setTimeout(function () { los(null); }, 9000);        // Notbremse
 
   /* Schritt 2: Geometrie - mit dem KI-Viereck als Kandidat. */
-  var geometrie = function (kiQuad, kiKonf) {
+  var geometrie = function (kiQuad, kiKonf, gitter) {
     if (fertig) { return; }
     var kopie = new Uint8ClampedArray(bilddaten.data);  // Puffer wird uebertragen
-    standbildWartet[marke] = function (quad) { los(quad); };
+    standbildWartet[marke] = function (quad) { los(quad, gitter); };
     setTimeout(function () {                            // zweite Notbremse
       if (standbildWartet[marke]) {
         delete standbildWartet[marke];
-        los(kiQuad || null);
+        los(kiQuad || null, gitter);
       }
     }, 5000);
     erkWorker.postMessage({
@@ -1030,18 +1102,21 @@ function scanMitVorerkennung(bilddaten) {
    * fallen nicht auf. */
   if (kiWorker) {
     var kiFertig = false;
-    kiStandbild[marke] = function (quad, konf) {
+    /* Das Standbild darf hier ruhig laenger dauern: es kommt von einem
+     * mitgebrachten Foto, im Sucher laeuft nichts weiter. In dieser Zeit
+     * rechnet der Worker auch das Kruemmungs-Gitter mit. */
+    kiStandbild[marke] = function (quad, konf, gitter) {
       if (kiFertig) { return; }
       kiFertig = true;
-      geometrie(quad, konf);
+      geometrie(quad, konf, gitter);
     };
     setTimeout(function () {
       if (!kiFertig) {
         kiFertig = true;
         delete kiStandbild[marke];
-        geometrie(null, 0);
+        geometrie(null, 0, null);
       }
-    }, 3500);
+    }, 6500);
     var kiKopie = new Uint8ClampedArray(bilddaten.data);
     kiWorker.postMessage({
       typ: "standbild", marke: marke, rgba: kiKopie.buffer,
